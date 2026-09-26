@@ -25,7 +25,7 @@ from pathlib import Path
 import FreeCAD as App
 import Part
 
-VERSION = '0.12.0'
+VERSION = '0.12.1'
 PANEL_TAG = 'LayFlatPanel'
 STOCK_THICKNESS_TOL = 0.05
 TOL = 1e-5
@@ -1655,48 +1655,69 @@ def is_tagged_panel(node, target=None):
     return False
 
 
-def selected_panel_objects(doc, selection):
+def panel_tag_candidates(doc, selection):
+    """Expand selected units to individual components, never tag containers."""
     if not selection:
-        raise ExportError('Select one or more finished parts in the tree or 3D view first.')
-    result, seen = [], set()
-    for root, path, node, normal in assembly_seeds(doc, selection):
-        target = linked_target(node)
-        if is_container_object(target) or node.isDerivedFrom('Assembly::AssemblyLink'):
-            raise ExportError('Select individual parts rather than the whole assembly or group: ' + node.Label)
-        if node.Document != doc:
-            raise ExportError('Select the component in the active document. External source files are not tagged automatically.')
-        shape = Part.getShape(root, path) if path else Part.getShape(root)
-        if hasattr(target, 'Mesh') or shape.isNull() or not shape.Solids:
-            raise ExportError('Select a solid CAD part: ' + node.Label)
-        identity = object_id(node)
-        if identity not in seen:
-            is_tagged_panel(node, target)  # Check property compatibility before any writes.
-            result.append(node);seen.add(identity)
-    return result
+        raise ExportError('Select one or more parts, shelves or cabinets first.')
+    skipped = []
+    candidates = collect_manufacturing_parts(doc, selection, skipped)
+    result, by_object = [], {}
+    for candidate in candidates:
+        obj = candidate['tag_object']
+        identity = object_id(obj)
+        if identity in by_object:
+            by_object[identity]['solid_occurrences'] += 1
+            continue
+        row = dict(candidate)
+        row['solid_occurrences'] = 1
+        row['taggable'] = obj.Document == doc
+        by_object[identity] = row
+        result.append(row)
+    if not any(row['taggable'] for row in result):
+        raise ExportError('These components belong to an external source model. Open that model to tag its parts; external files are not edited automatically.')
+    return result, skipped
 
 
-def set_panel_tags(doc, objects, tagged=True):
-    """One undoable metadata edit; never writes to other source documents."""
-    if not objects:
-        raise ExportError('No parts were selected.')
-    if App.getActiveTransaction():
-        raise ExportError('Finish the current FreeCAD edit before changing panel tags.')
-    for obj in objects:
+def selected_panel_objects(doc, selection):
+    candidates, skipped = panel_tag_candidates(doc, selection)
+    return [candidate['tag_object'] for candidate in candidates if candidate['taggable']]
+
+
+def set_panel_tag_choices(doc, choices):
+    """Save mixed tag/untag choices as one metadata-only Undo step."""
+    decisions = {}
+    for obj, tagged in choices:
         if obj.Document != doc:
             raise ExportError('All tagged parts must belong to the active document.')
+        if not isinstance(tagged, bool):
+            raise ExportError('Panel tag values must be checked or unchecked.')
+        identity = object_id(obj)
+        if identity in decisions and decisions[identity][1] != tagged:
+            raise ExportError('Conflicting tag choices for ' + obj.Label)
         is_tagged_panel(obj)
+        decisions[identity] = (obj, tagged)
+    changed = [(obj, tagged) for obj, tagged in decisions.values() if is_tagged_panel(obj) != tagged]
+    if not changed:return 0
+    if App.getActiveTransaction():
+        raise ExportError('Finish the current FreeCAD edit before changing panel tags.')
     if not doc.UndoMode:doc.UndoMode = 1
-    doc.openTransaction('Tag parts as panels' if tagged else 'Remove panel tags')
+    doc.openTransaction('Update panel tags')
     try:
-        for obj in objects:
+        for obj, tagged in changed:
             if PANEL_TAG not in obj.PropertiesList:
                 obj.addProperty('App::PropertyBool', PANEL_TAG, 'Lay Flat',
                                 'Preselect this component in Lay Flat. False overrides a tag on a linked source. Geometry is unchanged.')
-            setattr(obj, PANEL_TAG, bool(tagged))
+            setattr(obj, PANEL_TAG, tagged)
         doc.commitTransaction()
     except Exception:
         doc.abortTransaction()
         raise
+    return len(changed)
+
+
+def set_panel_tags(doc, objects, tagged=True):
+    if not objects:raise ExportError('No parts were selected.')
+    return set_panel_tag_choices(doc, [(obj, bool(tagged)) for obj in objects])
 
 
 def collect_manufacturing_parts(doc, selection, skipped=None):
@@ -1767,6 +1788,7 @@ def collect_manufacturing_parts(doc, selection, skipped=None):
             # STEP and native solids are offered on the same terms at every thickness.
             tagged = is_tagged_panel(node, target)
             candidates.append({'shape': solid, 'label': label, 'normal': normal,
+                               'tag_object': node, 'component_label': target.Label,
                                'tagged_panel': tagged,
                                'selected_by_default': tagged or (object_id(root), path) in explicit,
                                'selection_root': root,

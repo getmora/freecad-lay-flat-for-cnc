@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Tag selected CAD components as panels, or clear their tags. Geometry is unchanged."""
+"""Review individual panel tags inside selected parts, shelves or cabinets."""
 from pathlib import Path
 import runpy
-import traceback
 import FreeCAD as App
 import FreeCADGui as Gui
-from PySide import QtWidgets
+from PySide import QtCore, QtWidgets
 
 
 def exporter_path():
@@ -16,40 +15,109 @@ def exporter_path():
     raise RuntimeError('Mestra_Flat_Export.FCMacro is missing. Run Install_Mestra_Lay_Flat.FCMacro from the extracted download.')
 
 
+def build_dialog(doc, candidates, skipped, parent):
+    dialog = QtWidgets.QDialog(parent)
+    dialog.setWindowTitle('Panel tags — individual parts')
+    dialog.resize(1050, 660)
+    layout = QtWidgets.QVBoxLayout(dialog)
+    intro = QtWidgets.QLabel('Check the individual parts that are panels. Selecting a shelf or cabinet expands its contents; '
+                             'fittings are listed too and are not automatically tagged. Existing tags start checked.')
+    intro.setWordWrap(True);layout.addWidget(intro)
+    search = QtWidgets.QLineEdit();search.setPlaceholderText('Find parts, for example board or arm…');layout.addWidget(search)
+    table = QtWidgets.QTableWidget(len(candidates), 4)
+    table.setHorizontalHeaderLabels(['Part: checked = panel', 'Unit / location', 'Current tag', 'Shared solids / placements'])
+    table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+    table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+    for col in [2, 3]:table.horizontalHeader().setSectionResizeMode(col, QtWidgets.QHeaderView.ResizeToContents)
+    table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+    table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+    table.verticalHeader().hide()
+    for index, candidate in enumerate(candidates):
+        item = QtWidgets.QTableWidgetItem(candidate['component_label'])
+        item.setToolTip(candidate['label'])
+        item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+        # Only saved tags preselect children of a container. Individually
+        # selected parts are an explicit request and can start checked.
+        checked = candidate['selected_by_default'] if candidate['taggable'] else candidate['tagged_panel']
+        item.setCheckState(QtCore.Qt.Checked if checked else QtCore.Qt.Unchecked)
+        if not candidate['taggable']:item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEnabled)
+        table.setItem(index, 0, item)
+        root = candidate['selection_root']
+        if 'Bay' in root.PropertiesList and 'RailPosition' in root.PropertiesList:
+            context = '%s · position %s' % (str(root.Bay), str(root.RailPosition))
+        else:context = candidate['label'].rsplit(' / ', 1)[0]
+        cell = QtWidgets.QTableWidgetItem(context);cell.setToolTip(candidate['label']);table.setItem(index, 1, cell)
+        current = 'Panel' if candidate['tagged_panel'] else 'Not tagged'
+        if not candidate['taggable']:current += ' (external source)'
+        table.setItem(index, 2, QtWidgets.QTableWidgetItem(current))
+        table.setItem(index, 3, QtWidgets.QTableWidgetItem(str(candidate['solid_occurrences'])))
+    layout.addWidget(table, 1)
+    row = QtWidgets.QHBoxLayout()
+    check_button = QtWidgets.QPushButton('Check shown');uncheck_button = QtWidgets.QPushButton('Uncheck shown')
+    row.addWidget(check_button);row.addWidget(uncheck_button);row.addStretch()
+    count = QtWidgets.QLabel();row.addWidget(count);layout.addLayout(row)
+    note = QtWidgets.QLabel('A saved tag belongs to the component, so shared placements use the same tag. '
+                            'The final Lay Flat picker still lets you choose placements individually. Save the model (.FCStd) to retain tags.')
+    note.setWordWrap(True);layout.addWidget(note)
+    if skipped:
+        note = QtWidgets.QLabel('%d non-solid items could not be listed. Hover for details.' % len(skipped))
+        note.setToolTip('\n'.join('%s: %s' % (item['label'], item['reason']) for item in skipped));layout.addWidget(note)
+    buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel)
+    save = buttons.button(QtWidgets.QDialogButtonBox.Save);save.setText('Save panel tags')
+    layout.addWidget(buttons)
+    def choices():
+        return [(candidate['tag_object'], table.item(index, 0).checkState() == QtCore.Qt.Checked)
+                for index, candidate in enumerate(candidates) if candidate['taggable']]
+    def update_count(*args):
+        changes = sum(candidate['taggable'] and (table.item(index, 0).checkState() == QtCore.Qt.Checked) != candidate['tagged_panel']
+                      for index, candidate in enumerate(candidates))
+        checked = sum(table.item(index, 0).checkState() == QtCore.Qt.Checked for index in range(len(candidates)))
+        hidden = sum(table.isRowHidden(index) and candidate['taggable'] and
+                     (table.item(index, 0).checkState() == QtCore.Qt.Checked) != candidate['tagged_panel']
+                     for index, candidate in enumerate(candidates))
+        count.setText('%d checked · %d changes%s' % (checked, changes, ' (%d hidden by search)' % hidden if hidden else ''))
+        save.setEnabled(changes > 0)
+    def check_shown(value):
+        table.blockSignals(True)
+        try:
+            for index, candidate in enumerate(candidates):
+                if candidate['taggable'] and not table.isRowHidden(index):
+                    table.item(index, 0).setCheckState(QtCore.Qt.Checked if value else QtCore.Qt.Unchecked)
+        finally:table.blockSignals(False)
+        update_count()
+    def filter_parts(text):
+        text = text.casefold()
+        for index, candidate in enumerate(candidates):
+            haystack = candidate['component_label'] + ' ' + candidate['label']
+            table.setRowHidden(index, text not in haystack.casefold())
+        update_count()
+    def highlight():
+        try:
+            Gui.Selection.clearSelection()
+            for index in table.selectionModel().selectedRows():
+                candidate = candidates[index.row()];root = candidate['selection_root']
+                Gui.Selection.addSelection(root.Document.Name, root.Name, candidate['selection_path'])
+        except Exception as error:App.Console.PrintWarning('Could not highlight component: %s\n' % error)
+    check_button.clicked.connect(lambda:check_shown(True));uncheck_button.clicked.connect(lambda:check_shown(False))
+    search.textChanged.connect(filter_parts);table.itemChanged.connect(update_count);table.itemSelectionChanged.connect(highlight)
+    buttons.accepted.connect(dialog.accept);buttons.rejected.connect(dialog.reject);update_count()
+    dialog.part_table=table;dialog.part_search=search;dialog.check_button=check_button;dialog.uncheck_button=uncheck_button
+    dialog.tag_choices=choices;dialog.save_button=save
+    return dialog
+
+
 def run():
     parent = Gui.getMainWindow()
     try:
         doc = App.ActiveDocument
-        if doc is None:raise ValueError('Open a model and select one or more finished parts first.')
+        if doc is None:raise ValueError('Open a model and select parts, shelves or cabinets first.')
         api = runpy.run_path(str(exporter_path()), run_name='mestra_panel_tag_library')
-        objects = api['selected_panel_objects'](doc, Gui.Selection.getSelectionEx())
-        dialog = QtWidgets.QDialog(parent)
-        dialog.setWindowTitle('Panel tags')
-        dialog.resize(560, 360)
-        layout = QtWidgets.QVBoxLayout(dialog)
-        note = QtWidgets.QLabel('Tag these components as panels to preselect them in Lay Flat. '
-                                'The final export list stays editable. Geometry will not change.')
-        note.setWordWrap(True);layout.addWidget(note)
-        listing = QtWidgets.QListWidget()
-        for obj in objects:
-            state = 'Panel' if api['is_tagged_panel'](obj) else 'Not tagged'
-            listing.addItem('%s — %s' % (obj.Label, state))
-        layout.addWidget(listing)
-        note = QtWidgets.QLabel('A tag applies to every solid and placement sharing this component. '
-                                'Save the FreeCAD model (.FCStd) to keep the tags.')
-        note.setWordWrap(True);layout.addWidget(note)
-        controls = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Cancel)
-        tag = controls.addButton('Tag as panels', QtWidgets.QDialogButtonBox.AcceptRole)
-        clear = controls.addButton('Remove panel tags', QtWidgets.QDialogButtonBox.ActionRole)
-        choice = {'value': None}
-        def choose(value):choice['value'] = value;dialog.accept()
-        tag.clicked.connect(lambda:choose(True));clear.clicked.connect(lambda:choose(False))
-        controls.rejected.connect(dialog.reject);layout.addWidget(controls)
+        candidates, skipped = api['panel_tag_candidates'](doc, Gui.Selection.getSelectionEx())
+        dialog = build_dialog(doc, candidates, skipped, parent)
         if dialog.exec() != QtWidgets.QDialog.Accepted:return
-        api['set_panel_tags'](doc, objects, choice['value'])
-        message = '%d component(s) %s. Save the model to keep this change.' % (len(objects), 'tagged as panels' if choice['value'] else 'untagged')
-        parent.statusBar().showMessage(message, 12000)
-        App.Console.PrintMessage(message + '\n')
+        count = api['set_panel_tag_choices'](doc, dialog.tag_choices())
+        message = '%d component tag(s) updated. Save the model to keep this change.' % count
+        parent.statusBar().showMessage(message, 12000);App.Console.PrintMessage(message + '\n')
     except Exception as error:
         App.Console.PrintError('Panel tags: %s\n' % error)
         QtWidgets.QMessageBox.warning(parent, 'Panel tags need attention', str(error))

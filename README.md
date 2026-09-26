@@ -1,8 +1,8 @@
-# Mestra Lay Flat 0.12.0
+# Mestra Lay Flat 0.12.1
 
 A portable FreeCAD macro bundle for tagging panels, choosing parts manually, and exporting flat sheet layouts. It works from solid CAD geometry, including imported STEP parts. No Mestra cabinet template or customer model is included or required.
 
-**[Download the complete ZIP](https://github.com/getmora/mestra-lay-flat/releases/download/v0.12.0/Mestra-Lay-Flat-0.12.0.zip)** · [Release notes](https://github.com/getmora/mestra-lay-flat/releases/tag/v0.12.0)
+**[Download the complete ZIP](https://github.com/getmora/mestra-lay-flat/releases/download/v0.12.1/Mestra-Lay-Flat-0.12.1.zip)** · [Release notes](https://github.com/getmora/mestra-lay-flat/releases/tag/v0.12.1)
 
 ## Install
 
@@ -20,7 +20,7 @@ Copy `Mestra_Flat_Export.FCMacro`, `Mestra_Panel_Tags.FCMacro`, and both SVG ico
 
 ## Tag once, choose each time
 
-1. Select one or more finished parts in the tree or 3D view. Click **Panel Tags**, review the list, and choose **Tag as panels**. Use **Remove panel tags** to clear them. Whole assemblies and groups are not automatically tagged.
+1. Select parts, complete shelves, cabinets or assemblies in the tree or 3D view. Click **Panel Tags** to expand the selection into individual components. Check the panels, leave fittings unchecked, and click **Save panel tags**. Uncheck an existing panel tag to remove it. Search plus **Check shown / Uncheck shown** makes batch tagging easier.
 2. Save your model as a FreeCAD `.FCStd` file to retain the tags. STEP files do not store these FreeCAD properties. Tags add metadata only; they do not alter geometry. Tag changes can be undone.
 3. Select an assembly/subassembly to limit the scope, or clear the selection to use the visible model. Click **Lay Flat**, review the checkboxes, and continue to sheet settings and export.
 
@@ -30,7 +30,9 @@ Names, file origin and thickness never automatically exclude a solid part. A par
 
 The saved Boolean property is **LayFlatPanel**, under **Lay Flat** in the Data properties. A tag on a local component overrides a tag on its linked source, including an explicit False value. Source tags can be inherited by links. A component reused in multiple assembly placements shares its tag; the export picker still lists each placement separately. A multi-solid component's tag applies to all of its solids. Use separate component objects if you need separate saved tags.
 
-The tagging command does not automatically edit external source documents. Tag a local component link, or open its source model explicitly if you want to tag that source definition.
+Selecting a complete unit does not automatically mark all its contents as panels. Existing child tags start checked; untagged children, including hardware, start unchecked. Individually selected parts can start checked because that selection is explicit. Shared component definitions are shown once with their solid/placement count, and the whole tag update is one undoable action.
+
+The tagging command does not automatically edit external source documents. External child components are read-only in the review list. Tag a local component link, or open its source model explicitly if you want to tag that source definition.
 
 ## Thickness and stock
 
