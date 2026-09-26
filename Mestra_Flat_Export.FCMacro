@@ -1,0 +1,2547 @@
+# -*- coding: utf-8 -*-
+"""Mestra Flat Export 0.12 -- self-contained FreeCAD macro, millimetres.
+
+Run in FreeCAD. Select finished Bodies/parts (optional); otherwise the dialog
+lists Bodies. Each solid is one part. Source objects are never changed.
+Manual solid-part selection. Panel tags are defaults, never exclusion rules.
+Thickness is measured from selected geometry; there is no stock-thickness whitelist.
+Supported: planar pockets, perpendicular holes/drill tips, ruled tapered cuts,
+and convex edge roundovers. Tapers carry explicit angle/depth contours; rounded
+finishing is marked as reference regions. Exact solids accompany every export.
+Prismatic/taper geometry is reconstructed; residual removal must stay inside
+identified roundover envelopes. Rebate extensions cannot remove final material.
+Fixed rotations/grain controls and stock sheets are set in the export dialog.
+"""
+import csv
+import json
+import math
+import os
+import re
+import tempfile
+import traceback
+from datetime import datetime
+from pathlib import Path
+
+import FreeCAD as App
+import Part
+
+VERSION = '0.12.0'
+PANEL_TAG = 'LayFlatPanel'
+STOCK_THICKNESS_TOL = 0.05
+TOL = 1e-5
+ANG_TOL = 1e-7
+Z = App.Vector(0, 0, 1)
+
+
+class ExportError(Exception):
+    """Geometry or output that cannot be exported without guessing."""
+
+
+def mm(value):
+    return ('%.6f' % float(value)).rstrip('0').rstrip('.') or '0'
+
+
+def token(value):
+    return mm(round(value, 4)).replace('.', 'P').replace('-', 'M')
+
+
+def safe_name(value):
+    return re.sub(r'[^A-Za-z0-9_-]+', '_', value).strip('_')[:90] or 'Part'
+
+
+def flat_face(face):
+    result = face.copy()
+    result.translate(App.Vector(0, 0, -result.CenterOfMass.z))
+    if result.normalAt(0, 0).z < 0:
+        result.reverse()
+    return result
+
+
+def face_of_wire(wire):
+    result = Part.Face(wire)
+    if result.normalAt(0, 0).z < 0:
+        result.reverse()
+    return result
+
+
+def is_horizontal(face):
+    return isinstance(face.Surface, Part.Plane) and abs(face.normalAt(0, 0).z) > 1 - ANG_TOL
+
+
+def circle_of_wire(wire):
+    edges = [e for e in wire.Edges if e.Length > TOL]
+    if not edges or not wire.isClosed() or not all(isinstance(e.Curve, Part.Circle) for e in edges):
+        return None
+    circle = edges[0].Curve
+    if any((e.Curve.Center - circle.Center).Length > TOL or abs(e.Curve.Radius - circle.Radius) > TOL for e in edges):
+        return None
+    if abs(sum(e.Length for e in edges) - 2 * math.pi * circle.Radius) > TOL:
+        return None
+    return circle.Center, circle.Radius
+
+
+def validate_edges(wire):
+    if not wire.isClosed():
+        raise ExportError('An operation boundary is open.')
+    if wire.BoundBox.ZLength > TOL:
+        raise ExportError('An operation boundary is not planar after flattening.')
+    for edge in wire.Edges:
+        if edge.Length <= TOL:
+            continue
+        if not isinstance(edge.Curve, (Part.Line, Part.Circle)):
+            raise ExportError('Unsupported %s boundary; only exact lines and circular arcs are exported.' % type(edge.Curve).__name__)
+
+
+def flatten_solid(solid, normal=None):
+    """Rigidly rotate each solid; never flatten the thickness or scale geometry."""
+    if not solid.isValid() or solid.Volume <= 0:
+        raise ExportError('Part is not a valid positive-volume solid.')
+    candidates = []
+    if normal is not None:
+        candidates = [App.Vector(normal)]
+    else:
+        for face in sorted(solid.Faces, key=lambda f: -f.Area):
+            if isinstance(face.Surface, Part.Plane):
+                n = face.normalAt(0, 0)
+                if not any(abs(n.dot(c)) > 1 - ANG_TOL for c in candidates):
+                    candidates.append(n)
+    if not candidates:
+        raise ExportError('No planar board face was found.')
+    variants = []
+    for n in candidates:
+        copy = solid.copy()
+        copy.Placement = App.Placement(App.Vector(), App.Rotation(n, Z)).multiply(copy.Placement)
+        variants.append((copy.BoundBox.ZLength, copy))
+    thickness, copy = min(variants, key=lambda item: item[0])
+    if thickness <= TOL:
+        raise ExportError('Part has zero thickness.')
+    # Resolve the automatic face sign towards the side with more recessed area.
+    if normal is None:
+        bb = copy.BoundBox
+        scores = {1: 0.0, -1: 0.0}
+        for face in copy.Faces:
+            if is_horizontal(face) and bb.ZMin + TOL < face.CenterOfMass.z < bb.ZMax - TOL:
+                scores[1 if face.normalAt(0, 0).z > 0 else -1] += face.Area
+        if scores[-1] > scores[1] + TOL:
+            copy.rotate(App.Vector(), App.Vector(0, 1, 0), 180)
+    # Align the longest horizontal straight edge with X, for readable drawings.
+    lines = [e for e in copy.Edges if e.Length > TOL and isinstance(e.Curve, Part.Line)
+             and e.BoundBox.ZLength < TOL]
+    if lines:
+        e = max(lines, key=lambda e: e.Length)
+        direction = e.valueAt(e.LastParameter) - e.valueAt(e.FirstParameter)
+        angle = math.degrees(math.atan2(direction.y, direction.x)) % 180
+        copy.rotate(App.Vector(), Z, -angle)
+    bb = copy.BoundBox
+    copy.translate(App.Vector(-bb.XMin, -bb.YMin, -bb.ZMin))
+    if normal is None and copy.BoundBox.ZLength >= min(copy.BoundBox.XLength, copy.BoundBox.YLength) - TOL:
+        raise ExportError('Ambiguous board thickness. Select a broad planar face and run again.')
+    return copy
+
+
+def operation(kind, side, face, depth=None, diameter=None, tip_depth=None):
+    flat = flat_face(face)
+    for wire in flat.Wires:
+        validate_edges(wire)
+    if kind == 'OUTLINE':
+        layer = 'OUTLINE_THROUGH'
+    elif kind == 'CUTOUT':
+        layer = 'CUTOUT_THROUGH'
+    elif kind == 'HOLE':
+        layer = 'HOLE_D%s_%s' % (token(diameter), 'THROUGH' if depth is None else 'DEPTH_%sMM' % token(depth))
+        if tip_depth is not None:
+            layer += '_TIP_%sMM' % token(tip_depth)
+    else:
+        layer = 'POCKET_%sMM' % token(depth)
+    return {'kind': kind, 'side': side, 'layer': layer, 'depth_mm': depth,
+            'diameter_mm': diameter, 'tip_depth_mm': tip_depth, 'face': flat}
+
+
+def tapered_cone(face):
+    if not isinstance(face.Surface, Part.Cone) or abs(face.Surface.Axis.z) < 1 - ANG_TOL:
+        return False
+    circles = [e.Curve for e in face.Edges if isinstance(e.Curve, Part.Circle) and e.Length > TOL]
+    return len({(round(c.Radius, 6), round(c.Center.z, 6)) for c in circles}) >= 2
+
+
+def orient_pull_front(shape):
+    # A tapered pull gets FRONT on the small-opening side. This changes only
+    # the rigid orientation; it does not infer a tool direction from a label.
+    votes = []
+    for face in shape.Faces:
+        if tapered_cone(face):
+            circles = [e.Curve for e in face.Edges if isinstance(e.Curve, Part.Circle)]
+            small, large = min(circles, key=lambda c: c.Radius), max(circles, key=lambda c: c.Radius)
+            if abs(small.Center.z-large.Center.z) > TOL:
+                votes.append(small.Center.z > large.Center.z)
+    if votes and any(v != votes[0] for v in votes):
+        raise ExportError('Opposing tapered features need an explicit machining setup.')
+    if votes and not votes[0]:
+        shape = shape.copy(); shape.rotate(App.Vector(), App.Vector(1, 0, 0), 180)
+        b = shape.BoundBox; shape.translate(App.Vector(-b.XMin, -b.YMin, -b.ZMin))
+    return shape
+
+
+def exterior_round(face, thickness):
+    surface = face.Surface
+    radius = getattr(surface, 'Radius', 0)
+    if not TOL < radius < thickness / 3:
+        return False
+    box = face.BoundBox
+    if not (box.ZMax <= radius + TOL or box.ZMin >= thickness-radius-TOL):
+        return False
+    u0,u1,v0,v1 = face.ParameterRange
+    u,v = (u0+u1)/2,(v0+v1)/2
+    point = face.valueAt(u,v)
+    if isinstance(surface, Part.Cylinder):
+        if abs(surface.Axis.z) > ANG_TOL:
+            return False
+        radial = point-surface.Center
+        radial -= surface.Axis * radial.dot(surface.Axis)
+    elif isinstance(surface, Part.Sphere):
+        radial = point-surface.Center
+    else:
+        return False
+    return face.normalAt(u,v).dot(radial) > 0  # Convex edge, not a side bore.
+
+
+def level_wires(faces, level, bounds):
+    edges = []
+    for face in faces:
+        for edge in face.Edges:
+            if edge.Length > TOL and abs(edge.BoundBox.ZMin-level)<TOL and abs(edge.BoundBox.ZMax-level)<TOL:
+                if not any(edge.isSame(e) for e in edges): edges.append(edge)
+    wires = []
+    while edges:
+        chain = Part.__sortEdges__(edges)
+        if not chain: raise ExportError('Cannot order the tapered-cut boundary.')
+        edges = [e for e in edges if not any(e.isSame(c) for c in chain)]
+        wire = Part.Wire(chain)
+        if not wire.isClosed():
+            ends=[]
+            for edge in chain:
+                for vertex in edge.Vertexes:
+                    point=vertex.Point
+                    if not any((point-p).Length<TOL for p in ends): ends.append(point)
+            ends=[p for p in ends if sum(any((v.Point-p).Length<TOL for v in e.Vertexes) for e in chain)==1]
+            if len(ends)!=2:raise ExportError('An open taper does not have two boundary endpoints.')
+            a,b=ends
+            on_stock_edge=any(abs(getattr(a,axis)-bound)<TOL and abs(getattr(b,axis)-bound)<TOL
+                              for axis, bound in [('x',bounds.XMin),('x',bounds.XMax),('y',bounds.YMin),('y',bounds.YMax)])
+            if not on_stock_edge:raise ExportError('Open taper ends do not lie on one panel edge.')
+            wire=Part.Wire(chain+[Part.makeLine(a,b)])
+        if not wire.isClosed():raise ExportError('Taper boundary is not closed.')
+        wires.append(wire)
+    return wires
+
+
+def extract_tapers(shape, faces):
+    groups={}
+    for face in faces:
+        angle=math.degrees(abs(face.Surface.SemiAngle)) if isinstance(face.Surface,Part.Cone) else math.degrees(math.asin(abs(face.normalAt(0,0).z)))
+        key=(round(face.BoundBox.ZMin,6),round(face.BoundBox.ZMax,6),round(angle,6))
+        groups.setdefault(key,[]).append(face)
+    results=[]
+    for (low,high,angle),fs in groups.items():
+        lower=level_wires(fs,low,shape.BoundBox);upper=level_wires(fs,high,shape.BoundBox)
+        if not lower or len(lower)!=len(upper):raise ExportError('Taper boundary counts do not match.')
+        used=set()
+        for lo in lower:
+            options=[(i,hi) for i,hi in enumerate(upper) if i not in used]
+            i,hi=min(options,key=lambda pair:(Part.Face(lo).CenterOfMass-Part.Face(pair[1]).CenterOfMass).Length)
+            used.add(i)
+            # Ruled solid is bounded by the exact edge contours of the source faces.
+            cut=Part.makeLoft([lo,hi],True,True)
+            if not cut.isValid() or len(cut.Solids)!=1:raise ExportError('Taper contours do not form one valid solid.')
+            lowface,highface=Part.Face(lo),Part.Face(hi)
+            wide,narrow=(lowface,highface) if lowface.Area>highface.Area else (highface,lowface)
+            rear=wide.CenterOfMass.z<narrow.CenterOfMass.z
+            side='BACK' if rear else 'FRONT'
+            thickness=shape.BoundBox.ZLength
+            start=wide.CenterOfMass.z if rear else thickness-wide.CenterOfMass.z
+            end=narrow.CenterOfMass.z if rear else thickness-narrow.CenterOfMass.z
+            if end<=start+TOL:raise ExportError('Taper cutting depths are reversed.')
+            results.append({'solid':cut,'wide':wide,'narrow':narrow,'angle':angle,'side':side,'start':start,'end':end})
+    return results
+
+
+def manufacturing_footprint(shape, horizontal, round_faces):
+    projected=[flat_face(f) for f in horizontal]
+    # Include exact cross sections at the finishing-radius transitions. Broad
+    # faces alone are inset by a roundover and would make the blank too small.
+    levels={round(shape.BoundBox.ZLength/2,6)}
+    for face in round_faces:
+        levels.update([round(face.BoundBox.ZMin,6),round(face.BoundBox.ZMax,6)])
+    for level in sorted(levels):
+        if TOL<level<shape.BoundBox.ZLength-TOL:
+            wires=shape.slice(Z,level)
+            if wires:
+                section=Part.makeFace(wires,'Part::FaceMakerBullseye')
+                for face in section.Faces:projected.append(flat_face(face))
+    footprint=projected[0].multiFuse(projected[1:]).removeSplitter() if len(projected)>1 else projected[0]
+    if len(footprint.Faces)!=1:raise ExportError('The board silhouette is not one connected planar region.')
+    return footprint.Faces[0]
+
+def analyse_solid(solid, label, normal=None):
+    shape = orient_pull_front(flatten_solid(solid, normal))
+    bb = shape.BoundBox
+    thickness = bb.ZLength
+    volume_tolerance = max(1e-4, shape.Volume * 1e-9)
+    horizontal = []
+    cones = []
+    cylinders = []
+    taper_faces, round_faces = [], []
+    for i, face in enumerate(shape.Faces):
+        surface = face.Surface
+        if isinstance(surface, Part.Plane):
+            nz = abs(face.normalAt(0, 0).z)
+            if nz > 1 - ANG_TOL:
+                horizontal.append(face)
+            elif nz > ANG_TOL:
+                taper_faces.append(face)
+        elif isinstance(surface, (Part.Cylinder, Part.Cone)):
+            if abs(surface.Axis.z) < 1 - ANG_TOL:
+                if exterior_round(face, thickness):
+                    round_faces.append(face); continue
+                raise ExportError('Face %d is an unsupported side/angled hole.' % (i + 1))
+            if tapered_cone(face):
+                taper_faces.append(face)
+            else:
+                (cones if isinstance(surface, Part.Cone) else cylinders).append(face)
+        elif isinstance(surface, Part.Sphere) and exterior_round(face, thickness):
+            round_faces.append(face)
+        else:
+            raise ExportError('Face %d uses unsupported %s geometry.' % (i + 1, type(surface).__name__))
+    if not horizontal:
+        raise ExportError('No broad planar faces found.')
+    silhouette = manufacturing_footprint(shape, horizontal, round_faces)
+    outline_face = face_of_wire(silhouette.OuterWire)
+    blank = outline_face.extrude(App.Vector(0, 0, thickness))
+    operations = [operation('OUTLINE', 'FRONT', outline_face)]
+    removals = []
+    notes = []
+    # Inner loops of the complete silhouette are genuine through-openings.
+    for wire in silhouette.Wires:
+        if wire.isSame(silhouette.OuterWire):
+            continue
+        face = face_of_wire(wire)
+        circle = circle_of_wire(wire)
+        operations.append(operation('HOLE' if circle else 'CUTOUT', 'FRONT', face,
+                                    diameter=2 * circle[1] if circle else None))
+        removals.append(face.extrude(App.Vector(0, 0, thickness)))
+    # Planar recess floors. Keep true islands, but do not turn deeper holes into
+    # islands on the pocket layer: the pocket may safely pass over those voids.
+    for face in horizontal:
+        level = face.CenterOfMass.z
+        if level <= TOL or level >= thickness - TOL:
+            continue
+        is_front = face.normalAt(0, 0).z > 0
+        side = 'FRONT' if is_front else 'BACK'
+        depth = thickness - level if is_front else level
+        direction = App.Vector(0, 0, depth if is_front else -depth)
+        region = face_of_wire(face.OuterWire)
+        for wire in face.Wires:
+            if wire.isSame(face.OuterWire):
+                continue
+            island = face_of_wire(wire)
+            if island.extrude(direction).common(shape).Volume > volume_tolerance:
+                region = region.cut(island)
+        if len(region.Faces) != 1:
+            raise ExportError('A pocket floor could not be resolved into one region.')
+        removal = region.extrude(direction)
+        if removal.common(shape).Volume > volume_tolerance:
+            raise ExportError('An internal floor is covered by solid material (undercut or enclosed cavity).')
+        circle = circle_of_wire(region.Faces[0].OuterWire) if len(region.Wires) == 1 else None
+        operations.append(operation('HOLE' if circle else 'POCKET', side, region.Faces[0],
+                                    depth=depth, diameter=2 * circle[1] if circle else None))
+        removals.append(removal)
+    # Support true drill-point cones, not countersinks/tapers. Record both the
+    # full-diameter depth and the deepest point, from the original board face.
+    for cone in cones:
+        umin, umax, _, _ = cone.ParameterRange
+        if abs(umax - umin - 2 * math.pi) > ANG_TOL:
+            raise ExportError('Partial conical surface is unsupported.')
+        circles = [e.Curve for e in cone.Edges if e.Length > TOL and isinstance(e.Curve, Part.Circle) and e.Curve.Radius > TOL and e.isClosed()]
+        if len(circles) != 1:
+            raise ExportError('Countersinks or truncated cones are unsupported; only complete drill tips are supported.')
+        base = circles[0].Center
+        radius = circles[0].Radius
+        zlo, zhi = cone.BoundBox.ZMin, cone.BoundBox.ZMax
+        is_front = abs(base.z - zhi) < TOL
+        apex = zlo if is_front else zhi
+        if abs(apex - base.z) < TOL:
+            raise ExportError('Degenerate drill tip.')
+        matching = []
+        for cylinder in cylinders:
+            c = cylinder.Surface
+            cu, cv, _, _ = cylinder.ParameterRange
+            if abs(cv - cu - 2 * math.pi) > ANG_TOL or abs(c.Radius - radius) > TOL:
+                continue
+            axis_origin = c.Center
+            if math.hypot(axis_origin.x - base.x, axis_origin.y - base.y) > TOL:
+                continue
+            end = cylinder.BoundBox.ZMin if is_front else cylinder.BoundBox.ZMax
+            if abs(end - base.z) < TOL:
+                matching.append(cylinder)
+        if len(matching) != 1:
+            raise ExportError('Drill tip does not have one matching cylindrical bore.')
+        side = 'FRONT' if is_front else 'BACK'
+        depth = thickness - base.z if is_front else base.z
+        tip_depth = thickness - apex if is_front else apex
+        if depth <= TOL or tip_depth >= thickness - TOL:
+            raise ExportError('Drill tip crosses the opposite face or has ambiguous depth.')
+        direction = App.Vector(0, 0, -1 if is_front else 1)
+        tip_solid = Part.makeCone(radius, 0, abs(base.z - apex), base, direction)
+        shaft = Part.makeCylinder(radius, depth, base, -direction)
+        removal = shaft.fuse(tip_solid)
+        if removal.common(shape).Volume > volume_tolerance:
+            raise ExportError('A drill-tip hole cannot be reached from the broad face.')
+        wire = Part.Wire([Part.makeCircle(radius, App.Vector(base.x, base.y, 0))])
+        operations.append(operation('HOLE', side, Part.Face(wire), depth, 2 * radius, tip_depth))
+        removals.append(removal)
+        notes.append('Hole D%s: full diameter to %s mm; drill tip to %s mm, both measured from the original %s surface.' %
+                     (mm(2 * radius), mm(depth), mm(tip_depth), side.lower()))
+    for taper in extract_tapers(shape, taper_faces):
+        removals.append(taper['solid'])
+        # The wide mouth must also be clear up to the entry face. For open
+        # notches this void joins the stock edge and is not an inner floor wire.
+        if taper['start'] > TOL:
+            direction=App.Vector(0,0,-taper['start'] if taper['side']=='BACK' else taper['start'])
+            entry=taper['wide'].extrude(direction)
+            if entry.common(shape).Volume > volume_tolerance:
+                raise ExportError('The tapered cut cannot be entered from its wide side.')
+            removals.append(entry)
+        for contour, reference in [('wide', False), ('narrow', True)]:
+            op=operation('TAPER',taper['side'],taper[contour],depth=taper['end'])
+            op.update({'angle_deg':taper['angle'],'start_depth_mm':taper['start'],
+                       'end_depth_mm':taper['end'],'entry_clearance_depth_mm':taper['start'],'contour':contour,'reference_only':reference})
+            op['layer']=('REFERENCE_' if reference else '')+'TAPER_%sDEG_%s_START_%sMM_END_%sMM' % (token(taper['angle']),contour.upper(),token(taper['start']),token(taper['end']))
+            operations.append(op)
+        notes.append('%s: %s degree tapered cut, wide contour at depth %s mm, narrow contour at depth %s mm. Preserve the front land; use the exact STEP solid to set the cutter.' % (taper['side'],mm(taper['angle']),mm(taper['start']),mm(taper['end'])))
+    for face in round_faces:
+        if not isinstance(face.Surface,Part.Cylinder):continue
+        radius=face.Surface.Radius; box=face.BoundBox
+        if min(box.XLength,box.YLength)<=TOL:continue
+        side='FRONT' if box.ZMin>thickness/2 else 'BACK'
+        region=Part.Face(rectangle_wire(box.XLength,box.YLength,box.XMin,box.YMin))
+        op=operation('EDGE_ROUND',side,region,depth=radius)
+        op.update({'radius_mm':radius,'reference_only':True})
+        op['layer']='REFERENCE_EDGE_ROUND_R%sMM'%token(radius);operations.append(op)
+    if round_faces:
+        notes.append('Rounded edge finishing regions are reference envelopes, not cutting paths. Exact rounded geometry is retained in STEP and the flat 3D parts.')
+    # Strong guard against missed, invented or incorrectly oriented features.
+    # Rebuild the final part from exactly these interpreted operations.
+    reconstructed = blank
+    if removals:
+        cutters = removals[0].multiFuse(removals[1:]) if len(removals) > 1 else removals[0]
+        reconstructed = blank.cut(cutters)
+    extra = reconstructed.cut(shape).Volume
+    missing = shape.cut(reconstructed).Volume
+    roundover_volume=0.0
+    if round_faces and extra>volume_tolerance:
+        envelopes=[]
+        for face in round_faces:
+            box=face.BoundBox
+            envelopes.append(Part.makeBox(max(box.XLength, TOL)+2*TOL,max(box.YLength,TOL)+2*TOL,max(box.ZLength,TOL)+2*TOL,
+                                         App.Vector(box.XMin-TOL,box.YMin-TOL,box.ZMin-TOL)))
+        envelope=envelopes[0].multiFuse(envelopes[1:]) if len(envelopes)>1 else envelopes[0]
+        residual=reconstructed.cut(shape)
+        extra=residual.cut(envelope).Volume
+        roundover_volume=residual.Volume-extra
+    if max(extra, missing) > volume_tolerance:
+        raise ExportError('Operations do not reproduce this solid outside the labelled rounded-edge finishing regions (unexplained %.6f mm3, overcut %.6f mm3).' % (extra, missing))
+    return {'label': label, 'shape': shape, 'width_mm': bb.XLength,
+            'height_mm': bb.YLength, 'thickness_mm': thickness,
+            'operations': operations, 'notes': sorted(set(notes)),
+            'verification': {'unexplained_volume_mm3': extra, 'overcut_volume_mm3': missing,
+                             'tolerance_mm3': volume_tolerance, 'roundover_finishing_volume_mm3': roundover_volume,
+                             'method': 'Prismatic and ruled-taper reconstruction; remaining removal must lie within convex roundover envelopes.'}}
+
+
+# Minimal ASCII DXF writer. Geometry stays analytic: closed LWPOLYLINE with
+# circular-arc bulges, plus CIRCLE for round holes. No tessellation or splines.
+class Dxf:
+    def __init__(self, palette=None):
+        self.entities = []
+        self.palette = palette
+        self.layers = {'0': 7, 'LABELS': 7}
+
+    def add_wire(self, wire, layer, dx=0, dy=0, mirror_width=None):
+        validate_edges(wire)
+        self.layers[layer] = 7  # Final colour is assigned consistently when saving.
+        circle = circle_of_wire(wire)
+        def point(p):
+            return (dx + (mirror_width - p.x if mirror_width is not None else p.x), dy + p.y)
+        if circle:
+            center, radius = circle
+            x, y = point(center)
+            self.entities.append([(0, 'CIRCLE'), (100, 'AcDbEntity'), (8, layer), (100, 'AcDbCircle'),
+                                  (10, x), (20, y), (30, 0), (40, radius)])
+            return
+        vertices = []
+        last = None
+        first = None
+        for edge in wire.OrderedEdges:
+            if edge.Length <= TOL:
+                continue
+            a, b = edge.valueAt(edge.FirstParameter), edge.valueAt(edge.LastParameter)
+            if edge.Orientation == 'Reversed':
+                a, b = b, a
+            if last is not None and (a - last).Length > TOL:
+                raise ExportError('Wire edge ordering is not continuous.')
+            if first is None:
+                first = a
+            last = b
+            bulge = 0.0
+            if isinstance(edge.Curve, Part.Circle):
+                mid = edge.valueAt((edge.FirstParameter + edge.LastParameter) / 2)
+                cross = (mid - a).cross(b - mid).z
+                if abs(cross) < 1e-12:
+                    raise ExportError('Circular arc direction is ambiguous.')
+                sweep = edge.Length / edge.Curve.Radius
+                bulge = math.copysign(math.tan(sweep / 4), cross)
+                if mirror_width is not None:
+                    bulge = -bulge
+            x, y = point(a)
+            vertices.append((x, y, bulge))
+        if first is None or (last - first).Length > TOL:
+            raise ExportError('Export polyline did not close.')
+        tags = [(0, 'LWPOLYLINE'), (100, 'AcDbEntity'), (8, layer), (100, 'AcDbPolyline'),
+                (90, len(vertices)), (70, 1), (38, 0)]
+        for x, y, bulge in vertices:
+            tags += [(10, x), (20, y)]
+            if bulge:
+                tags += [(42, bulge)]
+        self.entities.append(tags)
+
+    def add_text(self, text, x, y, height=5):
+        # DXF text is ASCII; labels are metadata and never cutting geometry.
+        text = str(text).encode('ascii', 'replace').decode().replace('\n', ' ')
+        self.entities.append([(0, 'TEXT'), (100, 'AcDbEntity'), (8, 'LABELS'), (100, 'AcDbText'),
+                              (10, x), (20, y), (30, 0), (40, height), (1, text), (7, 'STANDARD')])
+
+    def add_line(self, a, b, layer='REFERENCE_GRAIN'):
+        self.layers[layer] = 7  # Final colour is assigned consistently when saving.
+        self.entities.append([(0, 'LINE'), (100, 'AcDbEntity'), (8, layer),
+                              (100, 'AcDbLine'), (10, a[0]), (20, a[1]), (30, 0),
+                              (11, b[0]), (21, b[1]), (31, 0)])
+
+    def save(self, path):
+        palette = self.palette if self.palette is not None else make_layer_palette(self.layers)
+        for layer in self.layers:
+            if layer not in palette:
+                raise ExportError('No colour assigned for layer %s.' % layer)
+            self.layers[layer] = palette[layer]['aci']
+        tags = [(0, 'SECTION'), (2, 'HEADER'), (9, '$ACADVER'), (1, 'AC1018'),
+                (9, '$INSUNITS'), (70, 4), (9, '$MEASUREMENT'), (70, 1),
+                (9, '$LUNITS'), (70, 2), (9, '$LUPREC'), (70, 6), (0, 'ENDSEC'),
+                (0, 'SECTION'), (2, 'TABLES'),
+                (0, 'TABLE'), (2, 'LTYPE'), (70, 1),
+                (0, 'LTYPE'), (100, 'AcDbSymbolTableRecord'), (100, 'AcDbLinetypeTableRecord'),
+                (2, 'CONTINUOUS'), (70, 0), (3, 'Solid line'), (72, 65), (73, 0), (40, 0), (0, 'ENDTAB'),
+                (0, 'TABLE'), (2, 'LAYER'), (70, len(self.layers))]
+        for name, colour in sorted(self.layers.items()):
+            tags += [(0, 'LAYER'), (100, 'AcDbSymbolTableRecord'), (100, 'AcDbLayerTableRecord'),
+                     (2, name), (70, 0), (62, colour), (6, 'CONTINUOUS')]
+            if 'true_colour' in palette[name]:
+                tags.append((420, palette[name]['true_colour']))
+        tags += [(0, 'ENDTAB'), (0, 'TABLE'), (2, 'STYLE'), (70, 1),
+                 (0, 'STYLE'), (100, 'AcDbSymbolTableRecord'), (100, 'AcDbTextStyleTableRecord'),
+                 (2, 'STANDARD'), (70, 0), (40, 0), (41, 1), (50, 0), (71, 0), (42, 2.5), (3, 'txt'), (4, ''),
+                 (0, 'ENDTAB'), (0, 'ENDSEC'), (0, 'SECTION'), (2, 'ENTITIES')]
+        for entity in self.entities:
+            tags.extend(entity)
+        tags += [(0, 'ENDSEC'), (0, 'EOF')]
+        # Explicit record handles avoid requiring a reader to repair table heads.
+        handled = []
+        next_handle = 0x100
+        table_name_next = False
+        table_handle = None
+        for code, value in tags:
+            handled.append((code, value))
+            if table_name_next:
+                table_handle = '%X' % next_handle
+                next_handle += 1
+                handled += [(5, table_handle), (330, '0'), (100, 'AcDbSymbolTable')]
+                table_name_next = False
+            elif code == 0 and value == 'TABLE':
+                table_name_next = True
+            elif code == 0 and value == 'ENDTAB':
+                table_handle = None
+            elif code == 0 and value in ('LTYPE', 'LAYER', 'STYLE', 'LWPOLYLINE', 'CIRCLE', 'TEXT', 'LINE'):
+                handled.append((5, '%X' % next_handle))
+                next_handle += 1
+                if table_handle is not None:
+                    handled.append((330, table_handle))
+        with open(path, 'w', encoding='ascii', newline='\n') as stream:
+            for code, value in handled:
+                # 12 decimal places preserve coordinates and arc bulges.
+                value = ('%.12f' % value).rstrip('0').rstrip('.') if isinstance(value, float) else str(value)
+                stream.write('%d\n%s\n' % (code, value))
+
+
+# Standard DXF ACI colours with RGB equivalents; no external runtime dependency.
+_LAYER_SWATCHES = (
+    (162, '#0029a5'), (92, '#00a500'), (12, '#a50000'), (202, '#7c00a5'), (32, '#a55200'), (132, '#00a5a5'),
+    (222, '#a5007c'), (52, '#a5a500'), (112, '#00a552'), (182, '#2900a5'), (72, '#52a500'), (242, '#a50029'),
+    (22, '#a52900'), (42, '#a57c00'), (62, '#7ca500'), (82, '#29a500'), (102, '#00a529'), (122, '#00a57c'),
+    (142, '#007ca5'), (152, '#0052a5'), (172, '#0000a5'), (192, '#5200a5'), (212, '#a500a5'), (232, '#a50052'),
+    (14, '#7f0000'), (24, '#7f1f00'), (34, '#7f3f00'), (44, '#7f5f00'), (54, '#7f7f00'), (64, '#5f7f00'),
+    (74, '#3f7f00'), (84, '#1f7f00'), (94, '#007f00'), (104, '#007f1f'), (114, '#007f3f'), (124, '#007f5f'),
+    (134, '#007f7f'), (144, '#005f7f'), (154, '#003f7f'), (164, '#001f7f'), (174, '#00007f'), (184, '#1f007f'),
+    (194, '#3f007f'), (204, '#5f007f'), (214, '#7f007f'), (224, '#7f005f'), (234, '#7f003f'), (244, '#7f001f'),
+    (13, '#a55252'), (23, '#a56752'), (33, '#a57c52'), (43, '#a59152'), (53, '#a5a552'), (63, '#91a552'),
+    (73, '#7ca552'), (83, '#67a552'), (93, '#52a552'), (103, '#52a567'), (113, '#52a57c'), (123, '#52a591'),
+    (133, '#52a5a5'), (143, '#5291a5'), (153, '#527ca5'), (163, '#5267a5'), (173, '#5252a5'), (183, '#6752a5'),
+    (193, '#7c52a5'), (203, '#9152a5'), (213, '#a552a5'), (223, '#a55291'), (233, '#a5527c'), (243, '#a55267'),
+    (15, '#7f3f3f'), (25, '#7f4f3f'), (35, '#7f5f3f'), (45, '#7f6f3f'), (55, '#7f7f3f'), (65, '#6f7f3f'),
+    (75, '#5f7f3f'), (85, '#4f7f3f'), (95, '#3f7f3f'), (105, '#3f7f4f'), (115, '#3f7f5f'), (125, '#3f7f6f'),
+    (135, '#3f7f7f'), (145, '#3f6f7f'), (155, '#3f5f7f'), (165, '#3f4f7f'), (175, '#3f3f7f'), (185, '#4f3f7f'),
+    (195, '#5f3f7f'), (205, '#6f3f7f'), (215, '#7f3f7f'), (225, '#7f3f6f'), (235, '#7f3f5f'), (245, '#7f3f4f'),
+    (10, '#ff0000'), (20, '#ff3f00'), (30, '#ff7f00'), (40, '#ffbf00'), (50, '#ffff00'), (60, '#bfff00'),
+    (70, '#7fff00'), (80, '#3fff00'), (90, '#00ff00'), (100, '#00ff3f'), (110, '#00ff7f'), (120, '#00ffbf'),
+    (130, '#00ffff'), (140, '#00bfff'), (150, '#007fff'), (160, '#003fff'), (170, '#0000ff'), (180, '#3f00ff'),
+    (190, '#7f00ff'), (200, '#bf00ff'), (210, '#ff00ff'), (220, '#ff00bf'), (230, '#ff007f'), (240, '#ff003f'),
+    (11, '#ff7f7f'), (21, '#ff9f7f'), (31, '#ffbf7f'), (41, '#ffdf7f'), (51, '#ffff7f'), (61, '#dfff7f'),
+    (71, '#bfff7f'), (81, '#9fff7f'), (91, '#7fff7f'), (101, '#7fff9f'), (111, '#7fffbf'), (121, '#7fffdf'),
+    (131, '#7fffff'), (141, '#7fdfff'), (151, '#7fbfff'), (161, '#7f9fff'), (171, '#7f7fff'), (181, '#9f7fff'),
+    (191, '#bf7fff'), (201, '#df7fff'), (211, '#ff7fff'), (221, '#ff7fdf'), (231, '#ff7fbf'), (241, '#ff7f9f'),
+    (16, '#4c0000'), (26, '#4c1300'), (36, '#4c2600'), (46, '#4c3900'), (56, '#4c4c00'), (66, '#394c00'),
+    (76, '#264c00'), (86, '#134c00'), (96, '#004c00'), (106, '#004c13'), (116, '#004c26'), (126, '#004c39'),
+    (136, '#004c4c'), (146, '#00394c'), (156, '#00264c'), (166, '#00134c'), (176, '#00004c'), (186, '#13004c'),
+    (196, '#26004c'), (206, '#39004c'), (216, '#4c004c'), (226, '#4c0039'), (236, '#4c0026'), (246, '#4c0013'),
+    (17, '#4c2626'), (27, '#4c2f26'), (37, '#4c3926'), (47, '#4c4226'), (57, '#4c4c26'), (67, '#424c26'),
+    (77, '#394c26'), (87, '#2f4c26'), (97, '#264c26'), (107, '#264c2f'), (117, '#264c39'), (127, '#264c42'),
+    (137, '#264c4c'), (147, '#26427e'), (157, '#26397e'), (167, '#262f7e'), (177, '#26267e'), (187, '#2f267e'),
+    (197, '#39267e'), (207, '#42264c'), (217, '#4c264c'), (227, '#4c2642'), (237, '#4c2639'), (247, '#4c262f'),
+)
+
+
+def make_layer_palette(layer_names):
+    """One colour per operation layer, shared across the entire export.
+
+    ACI keeps the existing DXF format compatible. The matching RGB swatches
+    are used by both previews. Never wrap the palette and duplicate a colour.
+    """
+    references = {
+        '0': (7, '#222222'), 'LABELS': (7, '#222222'),
+        'REFERENCE_SHEET': (8, '#808080'),
+        'REFERENCE_MARGIN': (9, '#c0c0c0'),
+        'REFERENCE_GRAIN': (253, '#999999'),
+        'REFERENCE_OUTLINE': (251, '#656565'),
+    }
+    palette = {name: {'aci': aci, 'hex': colour} for name, (aci, colour) in references.items()}
+    def order(name):
+        rank = 0 if name == 'OUTLINE_THROUGH' else 1 if name == 'CUTOUT_THROUGH' else 2 if name.startswith('POCKET_') else 3
+        numbers = tuple(float(n.replace('P', '.')) for n in re.findall(r'\d+(?:P\d+)?', name))
+        return rank, numbers, name
+    names = sorted(set(layer_names) - set(references), key=order)
+    if len(names) > len(_LAYER_SWATCHES):
+        raise ExportError('This export has more than %d distinct operation layers. Split it into smaller exports to keep every layer colour unique.' % len(_LAYER_SWATCHES))
+    for name, (aci, colour) in zip(names, _LAYER_SWATCHES):
+        palette[name] = {'aci': aci, 'hex': colour}
+    return palette
+
+
+def validate_layer_settings(settings):
+    used = {}
+    forbidden = set('<>/\\":;?*|=')
+    for source, style in settings.items():
+        name = str(style.get('name', source)).strip()
+        if not name or len(name) > 255:
+            raise ExportError('Layer names must contain between 1 and 255 characters.')
+        if any(ord(c) < 32 or ord(c) > 126 or c in forbidden for c in name):
+            raise ExportError('Layer name "%s" contains unsupported characters. Use plain letters, numbers, spaces, hyphens or underscores.' % name)
+        if name.upper() in ('0', 'LABELS') or (name.upper().startswith('REFERENCE_') and not (name == source and source.startswith(('REFERENCE_TAPER_', 'REFERENCE_EDGE_ROUND_')))):
+            raise ExportError('"%s" is reserved for reference geometry or labels.' % name)
+        key = name.casefold()
+        if key in used and used[key] != source:
+            raise ExportError('Two different operations cannot both be named "%s". Give each operation layer a unique name.' % name)
+        used[key] = source
+        if not re.fullmatch(r'#[0-9A-Fa-f]{6}', str(style.get('hex', ''))):
+            raise ExportError('Choose a valid colour for layer "%s".' % name)
+
+
+def nearest_aci(colour):
+    rgb = tuple(int(colour[i:i + 2], 16) for i in (1, 3, 5))
+    candidates = list(_LAYER_SWATCHES) + [(250, '#000000'), (255, '#ffffff'), (8, '#808080'), (9, '#c0c0c0')]
+    def difference(item):
+        value = item[1]
+        return sum((a - int(value[i:i + 2], 16)) ** 2 for a, i in zip(rgb, (1, 3, 5)))
+    return min(candidates, key=difference)[0]
+
+
+def apply_layer_settings(parts, settings):
+    """Rename/style copied operations; preserve the recognition key and depths."""
+    validate_layer_settings(settings)
+    defaults = make_layer_palette(op.get('source_layer', op['layer']) for p in parts for op in p['operations'])
+    result = []
+    for part in parts:
+        copy = dict(part)
+        copy['operations'] = []
+        for original in part['operations']:
+            op = dict(original)
+            source = original.get('source_layer', original['layer'])
+            style = settings.get(source, {'name': source, 'hex': defaults[source]['hex']})
+            op['source_layer'] = source
+            op['layer'] = style['name'].strip()
+            op['colour_hex'] = style['hex'].lower()
+            copy['operations'].append(op)
+        result.append(copy)
+    return result
+
+
+def palette_for_parts(parts):
+    operations = [op for p in parts for op in p['operations']]
+    defaults = make_layer_palette(op.get('source_layer', op['layer']) for op in operations)
+    palette = {name: dict(value) for name, value in defaults.items() if name in ('0', 'LABELS', 'REFERENCE_SHEET', 'REFERENCE_MARGIN', 'REFERENCE_GRAIN', 'REFERENCE_OUTLINE')}
+    for op in operations:
+        source = op.get('source_layer', op['layer'])
+        colour = op.get('colour_hex', defaults[source]['hex'])
+        if not re.fullmatch(r'#[0-9A-Fa-f]{6}', colour):
+            raise ExportError('Invalid colour for layer %s.' % op['layer'])
+        entry = {'aci': nearest_aci(colour), 'hex': colour.lower(), 'source_layer': source,
+                 'true_colour': int(colour[1:], 16)}
+        existing = palette.get(op['layer'])
+        if existing is not None and existing != entry:
+            raise ExportError('Conflicting colours or operations for layer %s.' % op['layer'])
+        palette[op['layer']] = entry
+    return palette
+
+
+def layer_rgb(palette, layer):
+    if layer not in palette:
+        raise ExportError('No colour assigned for layer %s.' % layer)
+    value = palette[layer]['hex'].lstrip('#')
+    return tuple(int(value[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+
+
+def grouped_face_operations(part, side):
+    """Group all matching holes/pockets under one visible layer per part face.
+
+    Hole names encode diameter, through/blind depth and any drill-tip depth.
+    Coordinates/feature numbers are deliberately absent from that layer key.
+    Front and back remain separate machining setups.
+    """
+    groups = {}
+    for op in face_operations(part, side):
+        groups.setdefault(op['layer'], []).append(op)
+    return list(groups.items())
+
+
+def face_operations(part, side):
+    if side == 'FRONT':
+        return [op for op in part['operations'] if op['side'] == 'FRONT']
+    # Back drawings are physically flipped left-to-right. Outline is reference
+    # only, and through-cuts are not duplicated as machining instructions.
+    outline = dict(part['operations'][0])
+    outline['layer'] = 'REFERENCE_OUTLINE'
+    return [outline] + [op for op in part['operations'] if op['side'] == 'BACK']
+
+
+def rectangle_wire(width, height, x=0, y=0):
+    points = [App.Vector(x, y, 0), App.Vector(x + width, y, 0),
+              App.Vector(x + width, y + height, 0), App.Vector(x, y + height, 0),
+              App.Vector(x, y, 0)]
+    return Part.Wire(Part.makePolygon(points).Edges)
+
+
+def canonical_xy_face(face):
+    """Rebuild analytic boundaries on one exact XY plane before booleans.
+
+    Flattened model faces may still carry microscopic plane/placement offsets.
+    Lines and circles stay analytic; only their already-flat Z coordinate is
+    normalized. No mesh approximation or polygon sampling is involved.
+    """
+    def xy(point):
+        return App.Vector(point.x, point.y, 0)
+
+    def rebuild_wire(wire):
+        validate_edges(wire)
+        circle = circle_of_wire(wire)
+        if circle:
+            center, radius = circle
+            return Part.Wire([Part.makeCircle(radius, xy(center), Z)])
+        edges = []
+        for edge in wire.OrderedEdges:
+            if edge.Length <= TOL:
+                continue
+            start = xy(edge.valueAt(edge.FirstParameter))
+            end = xy(edge.valueAt(edge.LastParameter))
+            if edge.Orientation == 'Reversed':
+                start, end = end, start
+            if isinstance(edge.Curve, Part.Line):
+                edges.append(Part.makeLine(start, end))
+            elif isinstance(edge.Curve, Part.Circle):
+                middle = xy(edge.valueAt((edge.FirstParameter + edge.LastParameter) / 2))
+                edges.append(Part.Arc(start, middle, end).toShape())
+            else:
+                raise ExportError('Rebate boundary has unsupported %s geometry.' % type(edge.Curve).__name__)
+        if not edges:
+            raise ExportError('Rebate boundary is empty.')
+        result = Part.Wire(edges)
+        validate_edges(result)
+        return result
+
+    outer = face.OuterWire
+    result = face_of_wire(rebuild_wire(outer))
+    for wire in face.Wires:
+        if not wire.isSame(outer):
+            result = result.cut(face_of_wire(rebuild_wire(wire)))
+    result = result.removeSplitter()
+    if len(result.Faces) != 1 or not result.isValid():
+        raise ExportError('Could not rebuild the original rebate on a common flat plane.')
+    result = flat_face(result.Faces[0])
+    if abs(result.Area - face.Area) > max(1e-5, face.Area * 1e-9):
+        raise ExportError('Flattening the rebate changed its area beyond tolerance.')
+    return result
+
+
+def extend_rebate(face, outline, distance, part_shape, depth, side):
+    """Continue clear straight exits without widening their endpoint spans.
+
+    The finished solid decides whether a route to the stock edge is already
+    clear to this operation's depth. This permits a shallow rebate to continue
+    through a deeper adjacent cut, but never the reverse. No clipping around
+    protected material is used: a blocked route is simply not an open exit.
+    """
+    if distance <= TOL:
+        return face.copy(), 0
+    if side not in ('FRONT', 'BACK') or depth is None or not math.isfinite(depth) or depth <= 0:
+        raise ExportError('Rebate extension needs a valid machining face and pocket depth.')
+    original = canonical_xy_face(face)
+    stock_outline = canonical_xy_face(outline)
+    thickness = part_shape.BoundBox.ZLength
+    if depth > thickness + TOL:
+        raise ExportError('Pocket depth exceeds the panel thickness.')
+    volume_tolerance = max(1e-4, part_shape.Volume * 1e-9)
+    area_tolerance = max(1e-5, original.Area * 1e-9)
+    z_base = part_shape.BoundBox.ZMax - depth if side == 'FRONT' else part_shape.BoundBox.ZMin
+
+    def band(a, b, direction, start, finish):
+        points = [a + direction * start, b + direction * start,
+                  b + direction * finish, a + direction * finish, a + direction * start]
+        return face_of_wire(Part.Wire(Part.makePolygon(points).Edges))
+
+    def machining_volume(region):
+        copy = region.copy()
+        copy.translate(App.Vector(0, 0, z_base))
+        return copy.extrude(App.Vector(0, 0, depth))
+
+    def is_clear(region):
+        return machining_volume(region).common(part_shape).Volume <= volume_tolerance
+
+    # A curved exterior exit is not silently approximated as a straight one.
+    exterior_contact = original.common(stock_outline.OuterWire)
+    for edge in exterior_contact.Edges:
+        if edge.Length > TOL and not isinstance(edge.Curve, Part.Line):
+            raise ExportError('Rebate extension has a curved outer-edge opening; only straight exits are supported.')
+    pocket_prism = original.extrude(Z)
+    additions, openings = [], []
+    for edge in original.OuterWire.Edges:
+        if edge.Length <= TOL or not isinstance(edge.Curve, Part.Line):
+            continue
+        a, b = edge.valueAt(edge.FirstParameter), edge.valueAt(edge.LastParameter)
+        tangent = b - a
+        tangent.normalize()
+        left = App.Vector(-tangent.y, tangent.x, 0)
+        middle = (a + b) * 0.5
+        probe = max(TOL * 20, min(0.01, edge.Length * 0.01, distance * 0.1))
+        left_inside = original.isInside(middle + left * probe, TOL, True)
+        right_inside = original.isInside(middle - left * probe, TOL, True)
+        if left_inside == right_inside:
+            raise ExportError('Cannot determine the outward direction of a straight rebate boundary.')
+        sign = -1 if left_inside else 1
+        outward = left * sign
+        # Measure the stock boundary in an edge-aligned coordinate frame. The
+        # strip has EXACTLY the original opening's width: endpoints do not grow.
+        angle = -math.degrees(math.atan2(tangent.y, tangent.x))
+        stock_local = stock_outline.copy()
+        stock_local.rotate(App.Vector(), Z, angle)
+        level = left.dot(a)
+        projected_reach = stock_local.BoundBox.YMax - level if sign > 0 else level - stock_local.BoundBox.YMin
+        search_reach = max(0, projected_reach) + distance
+        search_strip = band(a, b, outward, 0, search_reach)
+        stock_in_strip = stock_outline.common(search_strip)
+        stock_reach = 0.0
+        if not stock_in_strip.isNull() and stock_in_strip.Area > area_tolerance:
+            local = stock_in_strip.copy()
+            local.rotate(App.Vector(), Z, angle)
+            stock_reach = local.BoundBox.YMax - level if sign > 0 else level - local.BoundBox.YMin
+        reach = max(0, stock_reach) + distance
+        straight_extension = band(a, b, outward, 0, reach)
+        if not is_clear(straight_extension):
+            # This is an internal wall, not a clear exit. Never cut around it
+            # into a hook or broaden a deeper cut into a shallower neighbour.
+            continue
+        overlap = max(TOL * 50, min(0.25, distance / 4, edge.Length / 10))
+        patch = band(a, b, outward, -overlap, reach).extrude(Z)
+        # Only the small joining overlap is trimmed; the outward extension is
+        # untouched and remains straight. This handles rounded inside corners.
+        inward = band(a, b, outward, -overlap, 0)
+        trim = inward.cut(original)
+        if not trim.isNull() and trim.Area > TOL * TOL:
+            patch = patch.cut(trim.extrude(Z))
+        additions.append(patch)
+        openings.append({'a': a, 'b': b, 'normal': outward, 'reach': reach})
+    if not openings:
+        return face.copy(), 0
+
+    # When TWO open sides meet, extend both straight sides to their common
+    # outer corner. This fills the corner square/miter; it never widens a lone
+    # opening into a T. Only convex, outward corners are eligible.
+    corners = set()
+    for index, first in enumerate(openings):
+        for second in openings[index + 1:]:
+            shared = next((p for p in (first['a'], first['b'])
+                           if any((p - q).Length < TOL for q in (second['a'], second['b']))), None)
+            if shared is None:
+                continue
+            n1, n2 = first['normal'], second['normal']
+            determinant = n1.x * n2.y - n1.y * n2.x
+            if abs(determinant) < ANG_TOL:
+                continue
+            other1 = first['b'] if (first['a'] - shared).Length < TOL else first['a']
+            other2 = second['b'] if (second['a'] - shared).Length < TOL else second['a']
+            if (other1 - shared).dot(n2) >= -TOL or (other2 - shared).dot(n1) >= -TOL:
+                continue  # Keep concave corners; only fill an outward convex join.
+            r1, r2 = first['reach'], second['reach']
+            delta = App.Vector((r1 * n2.y - n1.y * r2) / determinant,
+                               (n1.x * r2 - r1 * n2.x) / determinant, 0)
+            key = tuple(round(v, 5) for v in shared)
+            if key in corners:
+                continue
+            test = shared + (n1 + n2) * max(TOL * 20, min(0.01, distance / 10))
+            if original.isInside(test, TOL, True):
+                continue  # Concave material-facing corner, not an outer join.
+            points = [shared, shared + n1 * r1, shared + delta, shared + n2 * r2, shared]
+            corner = face_of_wire(Part.Wire(Part.makePolygon(points).Edges))
+            if not corner.isValid():
+                raise ExportError('Cannot form a straight outer corner for these rebate exits.')
+            if not is_clear(corner):
+                raise ExportError('Joining two rebate extensions at their corner would remove finished panel material.')
+            additions.append(corner.extrude(Z))
+            corners.add(key)
+
+    united = pocket_prism.multiFuse(additions).removeSplitter()
+    if not united.isValid() or len(united.Solids) != 1:
+        raise ExportError('Straight rebate extension could not be joined (%d solids; %d faces; valid=%s).' %
+                          (len(united.Solids), len(united.Faces), united.isValid()))
+    if pocket_prism.cut(united).Volume > max(1e-5, pocket_prism.Volume * 1e-9):
+        raise ExportError('Rebate extension lost part of the original pocket.')
+    top_faces = [f for f in united.Faces if is_horizontal(f)
+                 and f.normalAt(0, 0).z > 0 and abs(f.CenterOfMass.z - 1.0) < TOL]
+    if len(top_faces) != 1:
+        raise ExportError('Straight rebate extension has %d top regions; one is required.' % len(top_faces))
+    expanded = canonical_xy_face(flat_face(top_faces[0]))
+    if original.cut(expanded).Area > area_tolerance:
+        raise ExportError('Straight extension lost part of the original 2D pocket.')
+    if expanded.Area <= original.Area + area_tolerance:
+        raise ExportError('The rebate extension did not add measurable clearance.')
+    # Validate at the REAL machining depth against the finished solid. Extra
+    # area may cross an already-deeper rebate but must remove no final material.
+    if not is_clear(expanded):
+        raise ExportError('Straight rebate extension would remove material from the finished panel.')
+    for wire in expanded.Wires:
+        validate_edges(wire)
+    return expanded, len(openings)
+
+
+def machining_feature(op):
+    return op.get('depth_mm') is not None and not op.get('reference_only', False) and op['kind'] in ('POCKET', 'HOLE', 'TAPER')
+
+
+def select_machining_face(part, flip_over=None):
+    """Put the face with most machining features at +Z; retain underside metadata."""
+    if 'machining_face' in part:
+        if flip_over is None or bool(flip_over)==part.get('manual_flip',False):
+            return part
+        part=part['_unoriented_part']
+    flip_over=bool(flip_over)
+    features={side:[op for op in part['operations'] if op['side']==side and machining_feature(op)] for side in ('FRONT','BACK')}
+    scores={side:(len(ops),sum(op['face'].Area for op in ops),sum(op['depth_mm'] for op in ops)) for side,ops in features.items()}
+    chosen='BACK' if scores['BACK']>scores['FRONT'] else 'FRONT'
+    if flip_over:chosen='FRONT' if chosen=='BACK' else 'BACK'
+    result=dict(part);result['machining_face']=chosen
+    result['_unoriented_part']=part;result['manual_flip']=flip_over
+    result['face_selection']={'rule':'Most recessed machining features; ties use total recessed area, then total depth.',
+                              'original_face_up':chosen,'manually_flipped':flip_over,
+                              'scores':{side:{'features':value[0],'recessed_area_mm2':value[1],'total_depth_mm':value[2]} for side,value in scores.items()}}
+    shape=part['shape'].copy()
+    flip=chosen=='BACK'
+    if flip:
+        shape.rotate(App.Vector(),App.Vector(0,1,0),180)
+        box=shape.BoundBox;shape.translate(App.Vector(-box.XMin,-box.YMin,-box.ZMin))
+    result['shape']=shape;result['operations']=[];result['underside_operations']=[]
+    for original in part['operations']:
+        op=dict(original);op['original_side']=original['side'];face=original['face'].copy()
+        if flip:
+            face.rotate(App.Vector(),App.Vector(0,1,0),180)
+            face.translate(App.Vector(part['width_mm'],0,0))
+        op['face']=flat_face(face)
+        through=op['kind'] in ('OUTLINE','CUTOUT') or (op['kind']=='HOLE' and op['depth_mm'] is None)
+        # The outline and through-openings belong in the single UP setup,
+        # regardless of which face originally held their drawing convention.
+        if through or op['side']==chosen:
+            op['side']='FRONT'  # Internal convention: +Z machining face.
+            result['operations'].append(op)
+        else:
+            op['side']='BACK';result['underside_operations'].append(op)
+    def map_note(text):
+        return re.sub(r'\b(FRONT|BACK|front|back)\b(?! land)',lambda m:'UP' if m.group(0).upper()==chosen else 'UNDERSIDE',text)
+    result['notes']=[map_note(note) for note in part['notes']]
+    result['underside_feature_count']=sum(machining_feature(op) for op in result['underside_operations'])
+    if result['underside_feature_count']:
+        result['notes'].append('%d underside machining feature(s) are not included in the UP DXF. They remain in the exact 3D part and the underside operations list in manifest.json.'%result['underside_feature_count'])
+    return result
+
+
+def face_label(side):
+    return 'UP' if side=='FRONT' else 'UNDERSIDE'
+
+
+def apply_part_options(part, rotation_deg=0, grain_axis='NONE', rebate_extension_mm=0, flip_over=None):
+    part = select_machining_face(part, flip_over)
+    if rotation_deg not in (0, 90, 180, 270):
+        raise ExportError('Part rotation must be 0, 90, 180 or 270 degrees.')
+    if grain_axis not in ('NONE', 'X', 'Y'):
+        raise ExportError('Unknown grain direction.')
+    if not math.isfinite(rebate_extension_mm) or rebate_extension_mm < 0:
+        raise ExportError('Rebate extension must be a finite, non-negative distance.')
+    result = dict(part)
+    result['notes'] = list(part['notes'])
+    result['reference_width_mm'] = part['width_mm']
+    result['reference_height_mm'] = part['height_mm']
+    result['rotation_deg'] = rotation_deg
+    result['grain_axis_before_rotation'] = grain_axis
+    result['grain_axis_on_sheet'] = ('Y' if grain_axis == 'X' else 'X') if grain_axis != 'NONE' and rotation_deg in (90, 270) else grain_axis
+    result['rebate_extension_mm'] = rebate_extension_mm
+    shape = part['shape'].copy()
+    shape.rotate(App.Vector(), Z, rotation_deg)
+    offset = App.Vector(-shape.BoundBox.XMin, -shape.BoundBox.YMin, 0)
+    shape.translate(offset)
+    result['shape'] = shape
+    result['width_mm'], result['height_mm'] = shape.BoundBox.XLength, shape.BoundBox.YLength
+    operations = []
+    for original in part['operations']:
+        op = dict(original)
+        face = original['face'].copy()
+        face.rotate(App.Vector(), Z, rotation_deg)
+        face.translate(offset)
+        op['face'] = flat_face(face)
+        operations.append(op)
+    outline = operations[0]['face']
+    extension_count = 0
+    for op in operations:
+        if op['kind'] == 'POCKET' and rebate_extension_mm > TOL:
+            try:
+                op['face'], count = extend_rebate(op['face'], outline, rebate_extension_mm, shape, op['depth_mm'], op['side'])
+            except Exception as exc:
+                raise ExportError('%s (%s, extension %s mm): %s' % (op['layer'], op['side'], mm(rebate_extension_mm), exc)) from exc
+            op['extended_open_edges'] = count
+            op['rebate_extension_mm'] = rebate_extension_mm if count else 0
+            extension_count += count
+    result['operations'] = operations
+    if rebate_extension_mm > TOL:
+        result['notes'].append('%d open rebate edge(s) extended by %s mm outside the finished outline.' % (extension_count, mm(rebate_extension_mm)))
+    # Reserve all front AND back operations at the same physical placement.
+    boxes = [op['face'].BoundBox for op in operations]
+    result['machining_bounds_mm'] = [min(b.XMin for b in boxes), min(b.YMin for b in boxes),
+                                     max(b.XMax for b in boxes), max(b.YMax for b in boxes)]
+    result['extended_open_edges'] = extension_count
+    return result
+
+
+def sheet_settings(values=None):
+    settings = {'width_mm': 2440.0, 'height_mm': 1220.0, 'margin_mm': 10.0,
+                'gap_mm': 10.0, 'grain_axis': 'X', 'extension_mm': 0.0}
+    if values:
+        settings.update(values)
+    for key in ('width_mm', 'height_mm', 'margin_mm', 'gap_mm', 'extension_mm'):
+        value = float(settings[key])
+        if not math.isfinite(value) or value < 0:
+            raise ExportError('Sheet dimensions, margin and spacing must be finite and non-negative.')
+        settings[key] = value
+    if min(settings['width_mm'], settings['height_mm']) <= 2 * settings['margin_mm'] + TOL:
+        raise ExportError('The sheet edge margin leaves no usable area.')
+    if settings['grain_axis'] not in ('X', 'Y'):
+        raise ExportError('Select grain along sheet length or sheet width.')
+    return settings
+
+
+def thickness_key(value):
+    value = float(value)
+    if not math.isfinite(value) or value <= TOL:
+        raise ExportError('A panel has an invalid detected thickness.')
+    # Remove geometric floating-point noise, not real stock differences.
+    return mm(round(value, 4))
+
+
+def stock_profiles(parts, settings=None):
+    keys = sorted({thickness_key(p['thickness_mm']) for p in parts}, key=float)
+    supplied = settings.get('by_thickness') if settings else None
+    profiles = {}
+    for key in keys:
+        if supplied is not None and key not in supplied:
+            raise ExportError('No sheet settings were provided for %s mm material.' % key)
+        values = supplied[key] if supplied is not None else settings
+        try:
+            profiles[key] = sheet_settings(values)
+        except Exception as exc:
+            raise ExportError('%s mm sheet settings: %s' % (key, exc)) from exc
+    return profiles
+
+
+def expand_quantity(part, quantity, source_row):
+    if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity < 0 or quantity > 999:
+        raise ExportError('Quantity must be a whole number from 0 to 999.')
+    copies = []
+    for index in range(1, quantity + 1):
+        copy = dict(part)
+        copy['source_row'] = source_row
+        copy['source_part_label'] = part['label']
+        copy['quantity_requested'] = quantity
+        copy['copy_number'] = index
+        if quantity > 1:
+            copy['label'] = '%s_copy_%02d_of_%02d' % (part['label'], index, quantity)
+        copies.append(copy)
+    return copies
+
+
+def split_free_rectangles(rectangles, used):
+    """MaxRects free-space splitting; orientations are supplied, never guessed."""
+    ux, uy, uw, uh = used
+    result = []
+    for x, y, w, h in rectangles:
+        if ux >= x + w - TOL or ux + uw <= x + TOL or uy >= y + h - TOL or uy + uh <= y + TOL:
+            result.append((x, y, w, h))
+            continue
+        if ux > x + TOL:
+            result.append((x, y, ux - x, h))
+        if ux + uw < x + w - TOL:
+            result.append((ux + uw, y, x + w - ux - uw, h))
+        if uy > y + TOL:
+            result.append((x, y, w, uy - y))
+        if uy + uh < y + h - TOL:
+            result.append((x, uy + uh, w, y + h - uy - uh))
+    pruned = []
+    for i, rect in enumerate(result):
+        x, y, w, h = rect
+        if w <= TOL or h <= TOL:
+            continue
+        contained = False
+        for j, other in enumerate(result):
+            if i == j:
+                continue
+            ox, oy, ow, oh = other
+            if x >= ox - TOL and y >= oy - TOL and x + w <= ox + ow + TOL and y + h <= oy + oh + TOL:
+                # Keep one representative when two free rectangles are equal.
+                equal = all(abs(a - b) < TOL for a, b in zip(rect, other))
+                if not equal or j < i:
+                    contained = True
+                    break
+        if not contained:
+            pruned.append(rect)
+    return pruned
+
+
+def pack_sheets(parts, settings):
+    profiles = stock_profiles(parts, settings)
+    sheets = []
+    indexed = list(enumerate(parts, 1))
+    # Largest rectangles first; this is practical rectangular packing, not an
+    # optimal material-yield claim or interlocking irregular-shape nesting.
+    indexed.sort(key=lambda pair: -(pair[1]['machining_bounds_mm'][2] - pair[1]['machining_bounds_mm'][0]) *
+                                  (pair[1]['machining_bounds_mm'][3] - pair[1]['machining_bounds_mm'][1]))
+    for index, part in indexed:
+        key = thickness_key(part['thickness_mm'])
+        profile = profiles[key]
+        margin, gap = profile['margin_mm'], profile['gap_mm']
+        width, height = profile['width_mm'], profile['height_mm']
+        usable_w, usable_h = width - 2 * margin, height - 2 * margin
+        if part['grain_axis_on_sheet'] not in ('NONE', profile['grain_axis']):
+            raise ExportError('%s: grain conflicts with the sheet. Rotate the part by 90 degrees, change its reference grain axis, or change the sheet grain setting.' % part['label'])
+        x0, y0, x1, y1 = part['machining_bounds_mm']
+        pw, ph = x1 - x0, y1 - y0
+        if pw > usable_w + TOL or ph > usable_h + TOL:
+            raise ExportError('%s needs %s × %s mm including rebate extensions and will not fit the usable %s × %s mm sheet at %d°. Change its rotation, sheet size or margin.' %
+                              (part['label'], mm(pw), mm(ph), mm(usable_w), mm(usable_h), part['rotation_deg']))
+        rw, rh = pw + gap, ph + gap
+        fits = []
+        for sheet in sheets:
+            if sheet['thickness_key'] != key:
+                continue
+            for fx, fy, fw, fh in sheet['_free']:
+                if rw <= fw + TOL and rh <= fh + TOL:
+                    fits.append((min(fw - rw, fh - rh), max(fw - rw, fh - rh), sheet['index'], fy, fx, sheet))
+        if fits:
+            _, _, _, fy, fx, sheet = min(fits, key=lambda f: f[:5])
+        else:
+            sheet = {'index': len(sheets) + 1, 'width_mm': width, 'height_mm': height,
+                     'thickness_mm': float(key), 'thickness_key': key, 'stock_settings': dict(profile), 'placements': [],
+                     '_free': [(margin, margin, usable_w + gap, usable_h + gap)]}
+            sheets.append(sheet)
+            fx, fy = margin, margin
+        sheet['placements'].append({'part_index': index, 'part': part,
+                                    'x_mm': fx - x0, 'y_mm': fy - y0,
+                                    'bounds_mm': [fx, fy, fx + pw, fy + ph]})
+        sheet['_free'] = split_free_rectangles(sheet['_free'], (fx, fy, rw, rh))
+    # Independent placement guard on every export, including expanded pockets.
+    for sheet in sheets:
+        profile = sheet['stock_settings']
+        width, height = sheet['width_mm'], sheet['height_mm']
+        margin, gap = profile['margin_mm'], profile['gap_mm']
+        for i, placement in enumerate(sheet['placements']):
+            a = placement['bounds_mm']
+            if a[0] < margin - TOL or a[1] < margin - TOL or a[2] > width - margin + TOL or a[3] > height - margin + TOL:
+                raise ExportError('Internal layout error: machining geometry crossed the sheet margin.')
+            for other in sheet['placements'][:i]:
+                b = other['bounds_mm']
+                separated = a[2] + gap <= b[0] + TOL or b[2] + gap <= a[0] + TOL or a[3] + gap <= b[1] + TOL or b[3] + gap <= a[1] + TOL
+                if not separated:
+                    raise ExportError('Internal layout error: two machining envelopes overlap or lack the requested spacing.')
+        sheet['has_back'] = any(op['side'] == 'BACK' for p in sheet['placements'] for op in p['part']['operations'])
+        sheet.pop('_free', None)
+    if not sheets:
+        raise ExportError('No parts were selected.')
+    return sheets
+
+
+def placed_wire(wire, placement, sheet, side):
+    copy = wire.copy()
+    copy.translate(App.Vector(placement['x_mm'], placement['y_mm'], 0))
+    if side == 'BACK':
+        copy.rotate(App.Vector(), App.Vector(0, 1, 0), 180)
+        copy.translate(App.Vector(sheet['width_mm'], 0, 0))
+    return copy
+
+
+def grain_segments(x, y, width, height, axis):
+    if axis == 'NONE':
+        return []
+    cx, cy = x + width / 2, y + height / 2
+    length = min(width, height) * 0.22
+    head = min(8, length / 4)
+    if axis == 'X':
+        a, b = (cx - length / 2, cy), (cx + length / 2, cy)
+        return [(a, b), (b, (b[0] - head, b[1] + head / 2)), (b, (b[0] - head, b[1] - head / 2))]
+    a, b = (cx, cy - length / 2), (cx, cy + length / 2)
+    return [(a, b), (b, (b[0] + head / 2, b[1] - head)), (b, (b[0] - head / 2, b[1] - head))]
+
+
+def sheet_drawing(sheet, side, settings, palette=None):
+    settings = sheet['stock_settings']
+    if palette is None:
+        palette = palette_for_parts([p['part'] for p in sheet['placements']])
+    drawing = Dxf(palette)
+    drawing.add_wire(rectangle_wire(sheet['width_mm'], sheet['height_mm']), 'REFERENCE_SHEET')
+    margin = settings['margin_mm']
+    if margin > TOL:
+        drawing.add_wire(rectangle_wire(sheet['width_mm'] - 2 * margin, sheet['height_mm'] - 2 * margin, margin, margin), 'REFERENCE_MARGIN')
+    for placement in sheet['placements']:
+        part = placement['part']
+        for op in face_operations(part, side):
+            for wire in op['face'].Wires:
+                drawing.add_wire(placed_wire(wire, placement, sheet, side), op['layer'])
+        x = placement['x_mm'] if side == 'FRONT' else sheet['width_mm'] - placement['x_mm'] - part['width_mm']
+        y = placement['y_mm']
+        drawing.add_text('%02d %s' % (placement['part_index'], part['label']), x + 3, y + 3, min(5, part['height_mm'] / 8))
+        for note_index,note in enumerate(cut_annotations(part,side)):
+            drawing.add_text(note,x+3,y+part['height_mm']/2+note_index*6,4)
+        for a, b in grain_segments(x, y, part['width_mm'], part['height_mm'], part['grain_axis_on_sheet']):
+            drawing.add_line(a, b)
+    drawing.add_text('SHEET %02d | %s | %s mm | STOCK GRAIN %s | reference layers are not cuts' %
+                     (sheet['index'], face_label(side), mm(sheet['thickness_mm']), settings['grain_axis']), 0, -18, 7)
+    return drawing
+
+
+def output_parts(parts, parent, title='Mestra', create_preview=True, settings=None):
+    """Write individual DXFs and bounded sheet DXFs into a fresh directory."""
+    # Preserve the callable API for callers supplying unconfigured analysed parts.
+    parts = [p if 'machining_bounds_mm' in p else apply_part_options(p) for p in parts]
+    settings = {'by_thickness': stock_profiles(parts, settings)}
+    sheets = pack_sheets(parts, settings)
+    palette = palette_for_parts(parts)
+    parent = Path(parent)
+    if not parent.is_dir():
+        raise ExportError('Choose an existing output folder.')
+    final_name = '%s_sheets_%s' % (safe_name(title), datetime.now().strftime('%Y%m%d_%H%M%S_%f'))
+    staging = Path(tempfile.mkdtemp(prefix='.mestra-export-', dir=str(parent)))
+    manifest = {'exporter_version': VERSION, 'units': 'mm', 'title': title,
+                'depth_datum': 'UP operation depths are measured from the original upward stock surface. Reported underside depths are measured from the opposite stock surface.',
+                'machining_face': 'Each panel is oriented with its most recessed machining features UP. Only this setup is drawn; underside features are reported separately.',
+                'underside_geometry': 'Exact STEP and FCStd solids retain both sides. No separate underside DXF or sheet layout is generated.',
+                'layout': 'Fixed-orientation rectangular packing of all machining envelopes, including rebate extensions. Reference and label layers are not toolpaths.',
+                'stock_settings': settings, 'dxf_version': 'R2004', 'layer_colours': palette, 'parts': [], 'sheets': []}
+    placements_by_index = {p['part_index']: (s, p) for s in sheets for p in s['placements']}
+    try:
+        for index, part in enumerate(parts, 1):
+            part_id = '%02d_%s' % (index, safe_name(part['label']))
+            record = {k: part[k] for k in ['label', 'width_mm', 'height_mm', 'thickness_mm', 'notes', 'verification',
+                       'rotation_deg', 'reference_width_mm', 'reference_height_mm', 'grain_axis_before_rotation',
+                       'grain_axis_on_sheet', 'rebate_extension_mm', 'machining_bounds_mm', 'extended_open_edges']}
+            record['id'], record['files'] = part_id, []
+            step_name=part_id+'.step'
+            part['shape'].exportStep(str(staging / step_name))
+            record['step_file']=step_name
+            record['source_row'] = part.get('source_row', index)
+            record['source_part_label'] = part.get('source_part_label', part['label'])
+            record['quantity_requested'] = part.get('quantity_requested', 1)
+            record['copy_number'] = part.get('copy_number', 1)
+            record['source_instance'] = part.get('source_instance', '')
+            record['source_document'] = part.get('source_document', '')
+            record['source_object'] = part.get('source_object', '')
+            record['verification_scope'] = 'Prismatic and ruled-taper operations are reconstructed; remaining finishing removal is confined to identified convex roundover envelopes. The STEP and flat FCStd files retain the exact final geometry. Rebate extensions are separately checked against the final solid.'
+            record['operations'] = [{**{k: v for k, v in op.items() if k != 'face'}, 'side': 'UP'} for op in part['operations']]
+            record['face_selection']=part['face_selection']
+            record['underside_feature_count']=part['underside_feature_count']
+            record['underside_operations']=[{**{k:v for k,v in op.items() if k!='face'}, 'side':'UNDERSIDE'} for op in part['underside_operations']]
+            sheet, placement = placements_by_index[index]
+            record['layer_groups'] = [{'face': face_label(side), 'layer': layer, 'feature_count': len(ops)}
+                for side in ('FRONT', 'BACK') for layer, ops in grouped_face_operations(part, side)
+                if side == 'FRONT' or any(op['side'] == 'BACK' for op in part['operations'])]
+            record['sheet'] = sheet['index']
+            record['sheet_origin_mm'] = [placement['x_mm'], placement['y_mm']]
+            sides = ['FRONT'] + (['BACK'] if any(op['side'] == 'BACK' for op in part['operations']) else [])
+            for side in sides:
+                drawing = Dxf(palette)
+                mirror = part['width_mm'] if side == 'BACK' else None
+                for op in face_operations(part, side):
+                    for wire in op['face'].Wires:
+                        drawing.add_wire(wire, op['layer'], mirror_width=mirror)
+                for a, b in grain_segments(0, 0, part['width_mm'], part['height_mm'], part['grain_axis_on_sheet']):
+                    drawing.add_line(a, b)
+                drawing.add_text('%s | %s | %s mm | %d deg' % (part_id, face_label(side), mm(part['thickness_mm']), part['rotation_deg']),
+                                 0, part['machining_bounds_mm'][1] - 12)
+                for note_index, note in enumerate(cut_annotations(part, side)):
+                    drawing.add_text(note, 3, part['height_mm']/2 + note_index*6, 4)
+                filename = part_id + '_' + face_label(side) + '.dxf'
+                drawing.save(staging / filename)
+                record['files'].append(filename)
+            manifest['parts'].append(record)
+        for sheet in sheets:
+            record = {k: sheet[k] for k in ('index', 'width_mm', 'height_mm', 'thickness_mm', 'has_back', 'stock_settings')}
+            record['placements'] = [{k: v for k, v in p.items() if k != 'part'} for p in sheet['placements']]
+            record['files'] = []
+            for side in ['FRONT'] + (['BACK'] if sheet['has_back'] else []):
+                filename = 'Sheet_%02d_%sMM_%s.dxf' % (sheet['index'], token(sheet['thickness_mm']), face_label(side))
+                sheet_drawing(sheet, side, settings, palette).save(staging / filename)
+                record['files'].append(filename)
+            manifest['sheets'].append(record)
+        with open(staging / 'parts.csv', 'w', newline='', encoding='utf-8-sig') as stream:
+            writer = csv.writer(stream)
+            writer.writerow(['Part', 'Label', 'Width_mm', 'Height_mm', 'Thickness_mm', 'Rotation_deg', 'Grain_axis_on_sheet',
+                             'Rebate_extension_mm', 'Sheet', 'Sheet_X_mm', 'Sheet_Y_mm', 'DXF_files',
+                             'Source_row', 'Copy_number', 'Row_quantity', 'Assembly_instance'])
+            for r in manifest['parts']:
+                writer.writerow([r['id'], r['label'], mm(r['width_mm']), mm(r['height_mm']), mm(r['thickness_mm']), r['rotation_deg'],
+                                 r['grain_axis_on_sheet'], mm(r['rebate_extension_mm']), r['sheet'],
+                                 mm(r['sheet_origin_mm'][0]), mm(r['sheet_origin_mm'][1]), '; '.join(r['files']),
+                                 r['source_row'], r['copy_number'], r['quantity_requested'], r['source_instance']])
+        quantities = {}
+        for r in manifest['parts']:
+            quantities.setdefault(r['source_row'], {'source_row': r['source_row'],
+                'label': r['source_part_label'], 'quantity': r['quantity_requested'],
+                'thickness_mm': r['thickness_mm'], 'source_instance': r['source_instance']})
+        manifest['quantities'] = list(quantities.values())
+        with open(staging / 'quantities.csv', 'w', newline='', encoding='utf-8-sig') as stream:
+            writer = csv.writer(stream)
+            writer.writerow(['Source_row', 'Part', 'Quantity', 'Thickness_mm', 'Assembly_instance'])
+            for q in manifest['quantities']:
+                writer.writerow([q['source_row'], q['label'], q['quantity'], mm(q['thickness_mm']), q['source_instance']])
+        (staging / 'SHEET_NOTES.txt').write_text(
+            'Use the Sheet_*.dxf files for the sheet layout. All dimensions are millimetres.\n'
+            'REFERENCE_SHEET, REFERENCE_MARGIN, REFERENCE_GRAIN, REFERENCE_OUTLINE and LABELS are not cutting operations.\n'
+            'Each panel has its most complex machining face UP. Only one UP layout is exported per sheet.\n'
+            'Any underside operations are listed in manifest.json and part notes; exact 3D files retain them.\n'
+            'Rebate exits extend straight; a shallow cut may pass through an existing deeper cut. The finished solid must remain unchanged.\n'
+            'Sheet spacing is measured between UP machining boundaries, including these extensions. Set spacing and margin for your tooling.\n'
+            'Grain is supplied by the user; it is not inferred from the model. Unspecified grain still uses the chosen fixed rotation.\n'
+            'Different thicknesses have independent sheet settings and never share a sheet. Same-thickness parts are assumed to use the same material.\n'
+            'Quantities are total copies per source row; assembly instances are preserved separately. See quantities.csv.\n'
+            'All depths are measured from the original board face. TIP distinguishes drill-tip depth from full-diameter depth.\n'
+            'Operation layer names and colours are user-editable; original identifiers and exact depths remain in manifest.json.\n'
+            'DXF R2004 stores chosen RGB colours with an indexed colour fallback.\n'
+            'Flat_parts.FCStd and individual STEP files preserve every final 3D feature.\n'
+            'TAPER layers give wide and narrow contours with angle and start/end depths from the named board face. These are geometry for CAM setup, not cutter-compensated toolpaths.\n'
+            'REFERENCE_TAPER and REFERENCE_EDGE_ROUND layers are guides, not through cuts. Rounded finishing regions are envelopes; use the exact STEP surface for cutter setup.\n'
+            'Parts were manually selected. Panel tags are selection defaults; names, STEP origin and thickness never exclude solid parts. Thickness is measured from geometry.\n', encoding='utf-8')
+        save_flat_solids(sheets, staging / 'Flat_parts.FCStd')
+        manifest['flat_parts_file']='Flat_parts.FCStd'
+        manifest['preview'] = {'requested': bool(create_preview), 'created': False}
+        if create_preview:
+            preview_path = staging / 'Sheet_layout.FCStd'
+            try:
+                save_sheet_preview(sheets, settings, preview_path, palette)
+                manifest['preview'].update({'created': True, 'file': preview_path.name})
+            except Exception as exc:
+                # DXF generation succeeded: report an optional preview failure
+                # separately instead of discarding the user's valid exports.
+                manifest['preview']['error'] = str(exc)
+                App.Console.PrintWarning('Mestra DXFs created, but the FreeCAD preview failed: %s\n' % exc)
+                if preview_path.exists():
+                    preview_path.unlink()
+        (staging / 'manifest.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
+        destination = parent / final_name
+        staging.rename(destination)
+        return destination, manifest
+    except Exception:
+        import shutil
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+
+def save_sheet_preview(sheets, settings, path, palette=None):
+    if palette is None:
+        palette = palette_for_parts([p['part'] for sheet in sheets for p in sheet['placements']])
+    previous = App.ActiveDocument
+    doc = App.newDocument('MestraSheetPreview')
+    try:
+        doc.Label = 'Mestra sheet layout'
+        marker = doc.addObject('App::FeaturePython', 'MestraSheetExportMarker')
+        marker.Label = 'Export preview — use the original model for new exports'
+        drawings = doc.addObject('App::DocumentObjectGroup', 'SheetLayouts')
+        drawings.Label = 'Sheet layouts — DXF lines'
+        reference_solids = doc.addObject('App::DocumentObjectGroup', 'ReferenceSolids')
+        reference_solids.Label = '3D copies — reference only'
+        solid_objects = []
+        offset_y = 0.0
+        for sheet in sheets:
+            sheet_profile = sheet['stock_settings']
+            solid_group = doc.addObject('App::DocumentObjectGroup', 'SheetSolidCopies')
+            solid_group.Label = 'Sheet %02d — 3D copies' % sheet['index']
+            reference_solids.addObject(solid_group)
+            for side in ['FRONT'] + (['BACK'] if sheet['has_back'] else []):
+                group = doc.addObject('App::DocumentObjectGroup', 'Sheet')
+                group.Label = 'Sheet %02d — %s — %s mm' % (sheet['index'], face_label(side), mm(sheet['thickness_mm']))
+                drawings.addObject(group)
+                boundary = doc.addObject('Part::Feature', 'SheetBoundary')
+                boundary.Label = 'REFERENCE_SHEET'
+                boundary.Shape = rectangle_wire(sheet['width_mm'], sheet['height_mm'], 0, offset_y)
+                group.addObject(boundary)
+                if App.GuiUp:
+                    boundary.ViewObject.LineColor = layer_rgb(palette, 'REFERENCE_SHEET')
+                margin = sheet_profile['margin_mm']
+                if margin > TOL:
+                    obj = doc.addObject('Part::Feature', 'SheetMargin')
+                    obj.Label = 'REFERENCE_MARGIN'
+                    obj.Shape = rectangle_wire(sheet['width_mm'] - 2 * margin, sheet['height_mm'] - 2 * margin, margin, offset_y + margin)
+                    group.addObject(obj)
+                    if App.GuiUp:
+                        obj.ViewObject.LineColor = layer_rgb(palette, 'REFERENCE_MARGIN')
+                for placement in sheet['placements']:
+                    part = placement['part']
+                    sub = doc.addObject('App::DocumentObjectGroup', 'Panel')
+                    sub.Label = '%02d %s — %d°' % (placement['part_index'], part['label'], part['rotation_deg'])
+                    group.addObject(sub)
+                    for layer, operations in grouped_face_operations(part, side):
+                        obj = doc.addObject('Part::Feature', 'OperationLayer')
+                        obj.Label = layer
+                        obj.addProperty('App::PropertyString', 'DxfLayer', 'Export').DxfLayer = layer
+                        obj.addProperty('App::PropertyInteger', 'FeatureCount', 'Export').FeatureCount = len(operations)
+                        wires = [placed_wire(w, placement, sheet, side) for op in operations for w in op['face'].Wires]
+                        shape = Part.makeCompound(wires)
+                        shape.translate(App.Vector(0, offset_y, 0))
+                        obj.Shape = shape
+                        sub.addObject(obj)
+                        if App.GuiUp:
+                            obj.ViewObject.LineColor = layer_rgb(palette, layer)
+                            obj.ViewObject.LineWidth = 2.0
+                            obj.ViewObject.DisplayMode = 'Wireframe'
+                            obj.ViewObject.Visibility = True
+                    x = placement['x_mm'] if side == 'FRONT' else sheet['width_mm'] - placement['x_mm'] - part['width_mm']
+                    y = placement['y_mm'] + offset_y
+                    segments = grain_segments(x, y, part['width_mm'], part['height_mm'], part['grain_axis_on_sheet'])
+                    if segments:
+                        obj = doc.addObject('Part::Feature', 'GrainDirection')
+                        obj.Label = 'REFERENCE_GRAIN'
+                        obj.Shape = Part.makeCompound([Part.makeLine(App.Vector(a[0], a[1], 0), App.Vector(b[0], b[1], 0)) for a, b in segments])
+                        sub.addObject(obj)
+                        if App.GuiUp:
+                            obj.ViewObject.LineColor = layer_rgb(palette, 'REFERENCE_GRAIN')
+                    if side == 'FRONT':
+                        obj = doc.addObject('Part::Feature', 'FlatPanel')
+                        obj.Label = '3D copy — ' + part['label']
+                        copy = part['shape'].copy()
+                        # The reference solid is entirely below the Z=0 drawing
+                        # plane. Even Show All cannot put it over the DXF lines
+                        # in the default top view. Actual DXF geometry is unchanged.
+                        preview_z = -copy.BoundBox.ZMax - 0.2
+                        copy.translate(App.Vector(placement['x_mm'], placement['y_mm'] + offset_y, preview_z))
+                        obj.Shape = copy
+                        solid_group.addObject(obj)
+                        solid_objects.append(obj)
+                        obj.addProperty('App::PropertyString', 'PreviewNote', 'Export').PreviewNote = 'Display-only copy below the DXF drawing plane; not exported as cutting geometry.'
+                        if App.GuiUp:
+                            obj.ViewObject.ShapeColor = (0.85, 0.85, 0.85)
+                            obj.ViewObject.DisplayMode = 'Flat Lines'
+                            obj.ViewObject.Visibility = False
+                    if App.GuiUp:
+                        label = doc.addObject('App::Annotation', 'PartLabel')
+                        label.LabelText = ['%02d %s' % (placement['part_index'], part['label'])]
+                        label.Position = App.Vector(x + 3, y + 3, 0)
+                        label.ViewObject.FontSize = 5
+                        sub.addObject(label)
+                if App.GuiUp:
+                    label = doc.addObject('App::Annotation', 'SheetLabel')
+                    label.LabelText = [group.Label + ' — stock grain ' + sheet_profile['grain_axis']]
+                    label.Position = App.Vector(0, offset_y - 20, 0)
+                    label.ViewObject.FontSize = 10
+                    group.addObject(label)
+                offset_y += sheet['height_mm'] + 150
+        doc.recompute()
+        if App.GuiUp:
+            import FreeCADGui as Gui
+            # Apply visibility after constructing the group tree: the drawing
+            # hierarchy contains no solids for group show/hide to reveal.
+            drawings.ViewObject.Visibility = True
+            reference_solids.ViewObject.Visibility = False
+            for obj in solid_objects:
+                obj.ViewObject.Visibility = False
+            Gui.activeDocument().activeView().viewTop()
+            Gui.activeDocument().activeView().fitAll()
+        doc.saveAs(str(path))
+    finally:
+        App.closeDocument(doc.Name)
+        if previous is not None:
+            App.setActiveDocument(previous.Name)
+
+
+def object_id(obj):
+    return (obj.Document.Name, obj.Name)
+
+
+def is_link_object(obj):
+    return obj.isDerivedFrom('App::Link') or obj.TypeId == 'App::LinkElement' or obj.isDerivedFrom('Assembly::AssemblyLink')
+
+
+def linked_target(obj):
+    current, seen = obj, set()
+    while is_link_object(current):
+        identity = object_id(current)
+        if identity in seen:
+            raise ExportError('%s contains a circular component link.' % obj.Label)
+        seen.add(identity)
+        if int(getattr(current, 'ElementCount', 0)) > 0:
+            raise ExportError('%s is a linked array. Expand it to individual component links before exporting; array quantities are not inferred.' % current.Label)
+        # Native AssemblyLink has an explicit LinkedObject property; ordinary
+        # App::Link resolves its current linked definition through its API.
+        if current.isDerivedFrom('Assembly::AssemblyLink'):
+            target = current.LinkedObject
+        else:
+            target = current.getLinkedObject() if hasattr(current, 'getLinkedObject') else getattr(current, 'LinkedObject', None)
+        if isinstance(target, tuple):
+            raise ExportError('%s links to a sub-element rather than a complete component.' % current.Label)
+        if target is None or target is current:
+            raise ExportError('%s has an unresolved component link. Load its source document first.' % current.Label)
+        current = target
+    return current
+
+
+def is_container_object(obj):
+    if obj.TypeId == 'PartDesign::Body':
+        return False  # A Body is a finished manufactured object, not its history.
+    return (obj.TypeId == 'App::LinkGroup' or obj.isDerivedFrom('App::Part') or obj.isDerivedFrom('App::DocumentObjectGroup')
+            or obj.isDerivedFrom('Assembly::AssemblyObject') or obj.isDerivedFrom('Assembly::AssemblyLink'))
+
+
+def is_construction_object(obj):
+    kind = obj.TypeId
+    return (kind.startswith(('Sketcher::', 'Assembly::Joint', 'App::Origin', 'App::Datum'))
+            or kind in ('App::LocalCoordinateSystem', 'PartDesign::Plane', 'PartDesign::Line',
+                        'PartDesign::Point', 'PartDesign::CoordinateSystem'))
+
+
+def default_candidates(doc):
+    # Use the document's ownership tree, not every feature or hidden prototype.
+    # A source Body referenced by several links must not become another copy.
+    if App.GuiUp:
+        import FreeCADGui as Gui
+        roots = list(Gui.getDocument(doc.Name).TreeRootObjects)
+    else:
+        roots = list(doc.RootObjects)
+    visible = [o for o in roots if not App.GuiUp or o.ViewObject.Visibility]
+    assemblies = []
+    for obj in visible:
+        if is_construction_object(obj):
+            continue
+        target = linked_target(obj)
+        if target.isDerivedFrom('Assembly::AssemblyObject') or obj.isDerivedFrom('Assembly::AssemblyLink'):
+            assemblies.append(obj)
+    if assemblies:
+        return assemblies
+    return [o for o in visible if not is_construction_object(o)
+            and (is_container_object(o) or is_link_object(o) or hasattr(o, 'Shape') or hasattr(o, 'Mesh'))]
+
+
+def assembly_seeds(doc, selection):
+    seeds = []
+    if not selection:
+        return [(obj, '', obj, None) for obj in default_candidates(doc)]
+    for item in selection:
+        root = item.Object
+        # Selecting Pad/Pocket history inside a Body means its finished Body.
+        if root.TypeId != 'PartDesign::Body' and not is_link_object(root) and hasattr(root, 'getParentGeoFeatureGroup'):
+            parent = root.getParentGeoFeatureGroup()
+            if parent is not None and parent.TypeId == 'PartDesign::Body':
+                root = parent
+        normal = next((face.normalAt(0, 0) for face in item.SubObjects
+                       if isinstance(face, Part.Face) and isinstance(face.Surface, Part.Plane)), None)
+        paths = list(item.SubElementNames) or ['']
+        if root.TypeId == 'PartDesign::Body' or linked_target(root).TypeId == 'PartDesign::Body':
+            paths = ['']
+        for selected_path in paths:
+            tokens = [token for token in selected_path.split('.') if token]
+            if tokens and re.fullmatch(r'(?:Face|Edge|Vertex)\d+', tokens[-1]):
+                tokens.pop()
+            path, node = '', root
+            for token in tokens:
+                path += token + '.'
+                try:
+                    _shape, _matrix, node = Part.getShape(root, path, retType=1)
+                except Exception as exc:
+                    raise ExportError('Cannot resolve selected component %s.%s: %s' % (root.Label, path, exc)) from exc
+                if node is None:
+                    raise ExportError('The selected component %s.%s is unavailable.' % (root.Label, path))
+                if linked_target(node).TypeId == 'PartDesign::Body':
+                    break
+            seeds.append((root, path, node, normal))
+    # Remove duplicate or overlapping selections, but never deduplicate links
+    # simply because they reference the same source definition.
+    unique = {}
+    for seed in seeds:
+        unique.setdefault((object_id(seed[0]), seed[1]), seed)
+    seeds = list(unique.values())
+
+    def owns(parent, child, seen=None):
+        if object_id(parent) == object_id(child):
+            return True
+        if is_link_object(parent) or not hasattr(parent, 'Group'):
+            return False
+        seen = set() if seen is None else seen
+        if object_id(parent) in seen:
+            return False
+        seen.add(object_id(parent))
+        return any(owns(obj, child, seen) for obj in parent.Group)
+
+    result = []
+    for seed in seeds:
+        root, path, node, _normal = seed
+        covered = False
+        for other in seeds:
+            if other is seed:
+                continue
+            oroot, opath, onode, _ = other
+            if object_id(root) == object_id(oroot) and path != opath and path.startswith(opath):
+                covered = True
+            elif object_id(root) != object_id(oroot) and not path and owns(onode, root):
+                covered = True
+        if not covered:
+            result.append(seed)
+    return result
+
+
+def is_tagged_panel(node, target=None):
+    """An explicit instance tag overrides the linked definition, including False."""
+    if PANEL_TAG in node.PropertiesList:
+        if node.getTypeIdOfProperty(PANEL_TAG) != 'App::PropertyBool':
+            raise ExportError('%s already has an incompatible %s property.' % (node.Label, PANEL_TAG))
+        return bool(getattr(node, PANEL_TAG))
+    target = target or linked_target(node)
+    if target is not node and PANEL_TAG in target.PropertiesList:
+        if target.getTypeIdOfProperty(PANEL_TAG) != 'App::PropertyBool':
+            raise ExportError('%s already has an incompatible %s property.' % (target.Label, PANEL_TAG))
+        return bool(getattr(target, PANEL_TAG))
+    return False
+
+
+def selected_panel_objects(doc, selection):
+    if not selection:
+        raise ExportError('Select one or more finished parts in the tree or 3D view first.')
+    result, seen = [], set()
+    for root, path, node, normal in assembly_seeds(doc, selection):
+        target = linked_target(node)
+        if is_container_object(target) or node.isDerivedFrom('Assembly::AssemblyLink'):
+            raise ExportError('Select individual parts rather than the whole assembly or group: ' + node.Label)
+        if node.Document != doc:
+            raise ExportError('Select the component in the active document. External source files are not tagged automatically.')
+        shape = Part.getShape(root, path) if path else Part.getShape(root)
+        if hasattr(target, 'Mesh') or shape.isNull() or not shape.Solids:
+            raise ExportError('Select a solid CAD part: ' + node.Label)
+        identity = object_id(node)
+        if identity not in seen:
+            is_tagged_panel(node, target)  # Check property compatibility before any writes.
+            result.append(node);seen.add(identity)
+    return result
+
+
+def set_panel_tags(doc, objects, tagged=True):
+    """One undoable metadata edit; never writes to other source documents."""
+    if not objects:
+        raise ExportError('No parts were selected.')
+    if App.getActiveTransaction():
+        raise ExportError('Finish the current FreeCAD edit before changing panel tags.')
+    for obj in objects:
+        if obj.Document != doc:
+            raise ExportError('All tagged parts must belong to the active document.')
+        is_tagged_panel(obj)
+    if not doc.UndoMode:doc.UndoMode = 1
+    doc.openTransaction('Tag parts as panels' if tagged else 'Remove panel tags')
+    try:
+        for obj in objects:
+            if PANEL_TAG not in obj.PropertiesList:
+                obj.addProperty('App::PropertyBool', PANEL_TAG, 'Lay Flat',
+                                'Preselect this component in Lay Flat. False overrides a tag on a linked source. Geometry is unchanged.')
+            setattr(obj, PANEL_TAG, bool(tagged))
+        doc.commitTransaction()
+    except Exception:
+        doc.abortTransaction()
+        raise
+
+
+def collect_manufacturing_parts(doc, selection, skipped=None):
+    candidates, seen_paths = [], set()
+    skipped = [] if skipped is None else skipped
+    seeds = assembly_seeds(doc, selection)
+    explicit = {(object_id(root), path) for root, path, node, normal in seeds
+                if not is_container_object(linked_target(node))}
+
+    def walk(root, path, node, labels, ancestors, normal):
+        if is_construction_object(node):
+            return
+        target = linked_target(node)
+        if is_construction_object(target):
+            return
+        semantic_id = object_id(target)
+        if semantic_id in ancestors:
+            raise ExportError('Circular assembly path: %s.%s' % (root.Label, path))
+        if len(ancestors) > 64:
+            raise ExportError('Assembly nesting exceeds 64 levels at %s.%s.' % (root.Label, path))
+        if is_container_object(target) or node.isDerivedFrom('Assembly::AssemblyLink'):
+            # Flexible native subassemblies contain their own component links.
+            # Rigid/ordinary links resolve children through the linked container.
+            if node.isDerivedFrom('Assembly::AssemblyLink') and not getattr(node, 'Rigid', True):
+                children = list(node.Group)
+            else:
+                children = list(target.ElementList) if target.TypeId == 'App::LinkGroup' else list(getattr(target, 'Group', []))
+            referenced = {object_id(linked_target(child)) for child in children
+                          if is_link_object(child) and not is_construction_object(child)}
+            for child in children:
+                # LinkGroup visibility belongs to the instance element, not the source Body.
+                # Ordinary assembly links also contain inactive configuration components.
+                if target.TypeId == 'App::LinkGroup':
+                    if not target.isElementVisible(child.Name):
+                        continue
+                elif App.GuiUp and not child.ViewObject.Visibility:
+                    continue
+                # Hidden local link prototypes are definitions, not placements.
+                if (not is_link_object(child) and object_id(child) in referenced
+                        and App.GuiUp and not child.ViewObject.Visibility):
+                    continue
+                walk(root, path + child.Name + '.', child, labels + [child.Label],
+                     ancestors + (semantic_id,), normal)
+            return
+        key = (object_id(root), path)
+        if key in seen_paths:
+            return
+        instance = '%s#%s.%s' % (root.Document.Name, root.Name, path)
+        if hasattr(target, 'Mesh'):
+            skipped.append({'label': ' / '.join(labels), 'source_instance': instance, 'reason': 'Mesh: solid CAD geometry required'})
+            return
+        if not hasattr(target, 'Shape') and not is_link_object(node):
+            return
+        try:
+            shape = Part.getShape(root, path) if path else Part.getShape(root)
+        except Exception as exc:
+            raise ExportError('Cannot read assembly instance %s: %s' % (instance, exc)) from exc
+        if shape.isNull() or not shape.Solids:
+            if target.TypeId == 'PartDesign::Body' or is_link_object(node):
+                raise ExportError('Assembly instance %s has no usable solid geometry.' % instance)
+            return
+        seen_paths.add(key)
+        for index, solid in enumerate(shape.Solids, 1):
+            label = ' / '.join(labels)
+            if len(shape.Solids) > 1:
+                label += '_%02d' % index
+            # Do not analyse machining or infer material before the user chooses.
+            # STEP and native solids are offered on the same terms at every thickness.
+            tagged = is_tagged_panel(node, target)
+            candidates.append({'shape': solid, 'label': label, 'normal': normal,
+                               'tagged_panel': tagged,
+                               'selected_by_default': tagged or (object_id(root), path) in explicit,
+                               'selection_root': root,
+                               'selection_path': path + ('Solid%d' % index if len(shape.Solids) > 1 else ''),
+                               'source_instance': instance + 'Solid%d' % index,
+                               'source_document': target.Document.Name, 'source_object': target.Name})
+
+
+    for root, path, node, normal in seeds:
+        labels = [root.Label] if not path else [root.Label, node.Label]
+        walk(root, path, node, labels, (), normal)
+    if not candidates:
+        raise ExportError('No solid CAD parts found. Select an assembly, a subassembly or finished parts. Meshes, sketches and construction geometry cannot be laid flat by this macro.')
+    return candidates
+
+
+def display_part_label(label):
+    labels=label.split(' / ')
+    return ' / '.join([x for x in labels[:-1] if 'bay ' in x.lower() or 'complete drawer' in x.lower()]+[labels[-1]])
+
+
+def build_part_picker(candidates, skipped, QtWidgets, QtCore, parent):
+    dialog = QtWidgets.QDialog(parent)
+    dialog.setWindowTitle('Choose parts to lay flat')
+    dialog.resize(1050, 650)
+    layout = QtWidgets.QVBoxLayout(dialog)
+    intro = QtWidgets.QLabel('Choose exactly which parts to lay flat. Panel tags and individually selected parts start checked. '
+                             'Names, STEP origin and thickness do not exclude solid parts.')
+    intro.setWordWrap(True);layout.addWidget(intro)
+    search = QtWidgets.QLineEdit();search.setPlaceholderText('Find a part…');layout.addWidget(search)
+    table = QtWidgets.QTableWidget(len(candidates), 3)
+    table.setObjectName('MestraPlywoodPartPicker')
+    table.setHorizontalHeaderLabels(['Part: checked = include', 'Panel tag', 'Current 3D size (mm)'])
+    table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+    for col in [1, 2]:table.horizontalHeader().setSectionResizeMode(col, QtWidgets.QHeaderView.ResizeToContents)
+    table.verticalHeader().setVisible(False)
+    table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+    table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+    for row, candidate in enumerate(candidates):
+        item = QtWidgets.QTableWidgetItem(display_part_label(candidate['label']))
+        item.setToolTip(candidate['label'])
+        item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+        item.setCheckState(QtCore.Qt.Checked if candidate['selected_by_default'] else QtCore.Qt.Unchecked)
+        table.setItem(row, 0, item)
+        table.setItem(row, 1, QtWidgets.QTableWidgetItem('Panel' if candidate['tagged_panel'] else 'Not tagged'))
+        box = candidate['shape'].BoundBox
+        size = QtWidgets.QTableWidgetItem(' × '.join(mm(value) for value in [box.XLength, box.YLength, box.ZLength]))
+        size.setToolTip('Bounding dimensions in the current model orientation. Actual panel thickness is measured after selection.')
+        table.setItem(row, 2, size)
+    layout.addWidget(table, 1)
+    controls = QtWidgets.QHBoxLayout()
+    tagged_button = QtWidgets.QPushButton('Select tagged panels')
+    shown_button = QtWidgets.QPushButton('Select shown')
+    clear_button = QtWidgets.QPushButton('Clear all')
+    for button in [tagged_button, shown_button, clear_button]:controls.addWidget(button)
+    controls.addStretch();count = QtWidgets.QLabel();controls.addWidget(count);layout.addLayout(controls)
+    def selected():
+        return [candidate for row, candidate in enumerate(candidates)
+                if table.item(row, 0).checkState() == QtCore.Qt.Checked]
+    def update_count(*args):
+        total = len(selected())
+        hidden = sum(table.isRowHidden(row) and table.item(row, 0).checkState() == QtCore.Qt.Checked
+                     for row in range(table.rowCount()))
+        count.setText('%d of %d selected%s' % (total, len(candidates), ' (%d hidden by search)' % hidden if hidden else ''))
+    def set_checks(mode):
+        table.blockSignals(True)
+        try:
+            for row, candidate in enumerate(candidates):
+                if mode == 'shown' and table.isRowHidden(row):continue
+                checked = mode == 'shown' or (mode == 'tagged' and candidate['tagged_panel'])
+                table.item(row, 0).setCheckState(QtCore.Qt.Checked if checked else QtCore.Qt.Unchecked)
+        finally:table.blockSignals(False)
+        update_count()
+    tagged_button.clicked.connect(lambda:set_checks('tagged'))
+    shown_button.clicked.connect(lambda:set_checks('shown'))
+    clear_button.clicked.connect(lambda:set_checks('clear'))
+    def filter_rows(text):
+        for row, candidate in enumerate(candidates):table.setRowHidden(row, text.casefold() not in candidate['label'].casefold())
+        update_count()
+    search.textChanged.connect(filter_rows);table.itemChanged.connect(update_count)
+    def highlight():
+        try:
+            import FreeCADGui as Gui
+            Gui.Selection.clearSelection()
+            for index in table.selectionModel().selectedRows():
+                candidate = candidates[index.row()];root = candidate['selection_root']
+                Gui.Selection.addSelection(root.Document.Name, root.Name, candidate['selection_path'])
+        except Exception as error:
+            App.Console.PrintWarning('Could not highlight part: %s\n' % error)
+    table.itemSelectionChanged.connect(highlight)
+    if skipped:
+        note = QtWidgets.QLabel('%d non-solid items could not be listed. Hover here for details.' % len(skipped))
+        note.setToolTip('\n'.join('%s: %s' % (item['label'], item['reason']) for item in skipped))
+        note.setWordWrap(True);layout.addWidget(note)
+    note = QtWidgets.QLabel('Next: selected parts are checked, thicknesses are measured, and sheet settings are shown. '
+                            'This selection does not change saved panel tags.')
+    note.setWordWrap(True);layout.addWidget(note)
+    buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+    buttons.button(QtWidgets.QDialogButtonBox.Ok).setText('Continue')
+    def accept_selection():
+        if not selected():
+            QtWidgets.QMessageBox.information(dialog, 'Choose a part', 'Select at least one part to lay flat.');return
+        dialog.accept()
+    buttons.accepted.connect(accept_selection);buttons.rejected.connect(dialog.reject)
+    layout.addWidget(buttons);update_count()
+    dialog.part_table = table
+    dialog.part_search = search
+    dialog.selected_candidates = selected
+    dialog.select_tagged_button = tagged_button
+    dialog.select_shown_button = shown_button
+    dialog.clear_button = clear_button
+    return dialog
+
+
+def choose_plywood_parts(candidates, skipped, QtWidgets, QtCore, parent):
+    dialog = build_part_picker(candidates, skipped, QtWidgets, QtCore, parent)
+    if dialog.exec() != QtWidgets.QDialog.Accepted:return None
+    return dialog.selected_candidates()
+
+
+def save_flat_solids(sheets, path):
+    """Standalone exact solids, grouped by sheet, with no external dependencies."""
+    previous=App.ActiveDocument;doc=App.newDocument('MestraFlatPlywood')
+    try:
+        doc.Label='Mestra plywood — laid flat'
+        marker=doc.addObject('App::FeaturePython','MestraSheetExportMarker');marker.Label='Export copy — source model unchanged'
+        offset_y=0.0
+        for sheet in sheets:
+            group=doc.addObject('App::DocumentObjectGroup','StockSheet')
+            group.Label='Sheet %02d — %s mm plywood'%(sheet['index'],mm(sheet['thickness_mm']))
+            for placement in sheet['placements']:
+                part=placement['part'];obj=doc.addObject('Part::Feature','FlatPlywoodPart')
+                obj.Label='%02d %s'%(placement['part_index'],part['label'])
+                exact=part['shape'].copy();exact.translate(App.Vector(placement['x_mm'],placement['y_mm']+offset_y,0))
+                if not exact.isValid():raise ExportError('Invalid flat copy: '+part['label'])
+                obj.Shape=exact;group.addObject(obj)
+                obj.addProperty('App::PropertyString','SourceInstance','Source').SourceInstance=part.get('source_instance','')
+                obj.addProperty('App::PropertyLength','StockThickness','Manufacturing').StockThickness=part['thickness_mm']
+                obj.addProperty('App::PropertyString','CutNotes','Manufacturing').CutNotes='\n'.join(part['notes'])
+                if App.GuiUp:
+                    obj.ViewObject.ShapeColor=(0.29,0.60,0.68) if abs(part['thickness_mm']-6)<STOCK_THICKNESS_TOL else (0.81,0.73,0.57)
+                    obj.ViewObject.DisplayMode='Flat Lines'
+            offset_y+=sheet['height_mm']+150
+        doc.recompute()
+        if App.GuiUp:
+            import FreeCADGui as Gui
+            Gui.activeDocument().activeView().viewTop();Gui.activeDocument().activeView().fitAll()
+        doc.saveAs(str(path))
+    finally:
+        App.closeDocument(doc.Name)
+        if previous is not None:App.setActiveDocument(previous.Name)
+
+
+def cut_annotations(part, side):
+    return ['%s deg taper: wide at %s mm, narrow at %s mm'%(mm(o['angle_deg']),mm(o['start_depth_mm']),mm(o['end_depth_mm']))
+            for o in part['operations'] if o['kind']=='TAPER' and o['contour']=='wide' and o['side']==side]
+
+
+def configure_parts(parts, QtWidgets, QtCore, QtGui, parent):
+    parts = [select_machining_face(p) for p in parts]
+    dialog = QtWidgets.QDialog(parent)
+    dialog.setWindowTitle('Mestra Flat Export %s — grain, rebates and sheets' % VERSION)
+    screen = parent.screen()
+    available = screen.availableGeometry() if screen is not None else None
+    dialog.resize(min(1120, int(available.width() * 0.9)) if available else 1120,
+                  min(900, int(available.height() * 0.85)) if available else 820)
+    outer_layout = QtWidgets.QVBoxLayout(dialog)
+    intro = QtWidgets.QLabel('The face with most recesses is placed UP; through-openings are cut from that same side. Use Flip over to change a part. One layout is exported per sheet.\nSet each panel’s total quantity and rotation, then preview the sheets. Each assembly instance is counted once before quantities are applied.\nA separate sheet section is provided for each detected thickness. Grain is supplied by you.')
+    intro.setWordWrap(True)
+    outer_layout.addWidget(intro)
+    underside=[p for p in parts if p['underside_feature_count']]
+    if underside:
+        note=QtWidgets.QLabel('%d selected part(s) also have underside machining. It is listed in the part notes and manifest, and retained in 3D; the UP DXFs cover the upper face only.'%len(underside))
+        note.setWordWrap(True);outer_layout.addWidget(note)
+    folder_row = QtWidgets.QHBoxLayout()
+    folder_row.addWidget(QtWidgets.QLabel('Export folder'))
+    directory_edit = QtWidgets.QLineEdit(str(Path.home() / 'Documents'))
+    directory_edit.setToolTip('A new, timestamped export folder will be created inside this folder.')
+    folder_row.addWidget(directory_edit, 1)
+    browse_button = QtWidgets.QPushButton('Browse…')
+    folder_row.addWidget(browse_button)
+    outer_layout.addLayout(folder_row)
+    folder_note = QtWidgets.QLabel('Each export creates a new folder with DXFs, exact STEP parts and Flat_parts.FCStd. Existing exports are kept.')
+    folder_note.setWordWrap(True)
+    outer_layout.addWidget(folder_note)
+    status = QtWidgets.QLabel('Choose an export folder, then adjust the panels below.')
+    status.setWordWrap(True)
+    status.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+    outer_layout.addWidget(status)
+    scroll = QtWidgets.QScrollArea(dialog)
+    scroll.setWidgetResizable(True)
+    scroll.setObjectName('MestraExportScroll')
+    scroll.setStyleSheet('QScrollArea#MestraExportScroll { background-color: #f5f5f5; border: 1px solid #d0d0d0; }')
+    content = QtWidgets.QWidget()
+    content.setObjectName('MestraExportContent')
+    content.setAutoFillBackground(True)
+    content_palette = content.palette()
+    content_palette.setColor(QtGui.QPalette.Window, QtGui.QColor('#f5f5f5'))
+    content_palette.setColor(QtGui.QPalette.WindowText, QtGui.QColor('#202020'))
+    content.setPalette(content_palette)
+    # Scope colours to this macro's scroll content, not FreeCAD's global theme.
+    # Tables/inputs keep their native control styling and layer swatches.
+    content.setStyleSheet('''
+        QWidget#MestraExportContent { background-color: #f5f5f5; color: #202020; }
+        QLabel { background-color: transparent; color: #202020; }
+        QGroupBox { color: #202020; background-color: #f5f5f5; }
+        QCheckBox { color: #202020; }
+    ''')
+    layout = QtWidgets.QVBoxLayout(content)
+    scroll.setWidget(content)
+    outer_layout.addWidget(scroll, 1)
+
+    def browse_directory():
+        try:
+            current = directory_edit.text().strip()
+            chosen = QtWidgets.QFileDialog.getExistingDirectory(dialog, 'Choose the export folder', current or str(Path.home() / 'Documents'))
+            if chosen:
+                directory_edit.setText(chosen)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(dialog, 'Could not choose a folder', str(exc))
+
+    browse_button.clicked.connect(browse_directory)
+    table = QtWidgets.QTableWidget(len(parts), 7)
+    table.setHorizontalHeaderLabels(['Part — checked = export', 'Size before rotation (mm)', 'Quantity', 'Rotation', 'Grain before rotation', 'Extend rebates', 'Flip over'])
+    table.verticalHeader().setVisible(False)
+    table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+    for column in range(1, 7):
+        table.horizontalHeader().setSectionResizeMode(column, QtWidgets.QHeaderView.ResizeToContents)
+    rotations, grains, extend_boxes, quantities, face_flips = [], [], [], [], []
+    for row, part in enumerate(parts):
+        item = QtWidgets.QTableWidgetItem('%02d  %s' % (row + 1, display_part_label(part['label'])))
+        item.setFlags((item.flags() | QtCore.Qt.ItemIsUserCheckable) & ~QtCore.Qt.ItemIsEditable)
+        item.setCheckState(QtCore.Qt.Checked)
+        table.setItem(row, 0, item)
+        size = QtWidgets.QTableWidgetItem('%s × %s × %s' % (mm(part['width_mm']), mm(part['height_mm']), mm(part['thickness_mm'])))
+        size.setFlags(size.flags() & ~QtCore.Qt.ItemIsEditable)
+        table.setItem(row, 1, size)
+        quantity = QtWidgets.QSpinBox()
+        quantity.setRange(0, 999)
+        quantity.setValue(1)
+        quantity.setKeyboardTracking(False)
+        quantity.setToolTip('Total copies to cut for this row, including the existing component. 0 excludes this row. Other assembly instances have their own rows.')
+        table.setCellWidget(row, 2, quantity)
+        quantities.append(quantity)
+        item.setToolTip(part.get('source_instance', part['label']))
+        angle = QtWidgets.QComboBox()
+        for degrees in (0, 90, 180, 270):
+            angle.addItem('%d°' % degrees, degrees)
+        angle.setToolTip('Counter-clockwise rotation in the flat view. The sheet packer will not change it.')
+        table.setCellWidget(row, 3, angle)
+        rotations.append(angle)
+        grain = QtWidgets.QComboBox()
+        grain.addItem('Unspecified — keep rotation', 'NONE')
+        grain.addItem('Along first dimension (X)', 'X')
+        grain.addItem('Along second dimension (Y)', 'Y')
+        grain.setToolTip('These dimensions refer to the unrotated size shown in this row. After rotation, specified grain must align with the sheet grain.')
+        table.setCellWidget(row, 4, grain)
+        grains.append(grain)
+        extend = QtWidgets.QCheckBox('Use thickness setting')
+        extend.setChecked(True)
+        extend.setToolTip('Apply the rebate extension from this part’s thickness section. At 0 mm, nothing is extended.')
+        table.setCellWidget(row, 5, extend)
+        extend_boxes.append(extend)
+        flip=QtWidgets.QCheckBox('Flip')
+        flip.setObjectName('MestraFlipPart%d'%row)
+        flip.setToolTip('Turn this part over from the automatic most-recessed-face-up orientation. Rotation in the flat view is unchanged.')
+        table.setCellWidget(row,6,flip);face_flips.append(flip)
+    table.setMinimumHeight(170)
+    table.setMaximumHeight(290)
+    layout.addWidget(table)
+    stock_controls = {}
+    detected_thicknesses = sorted({thickness_key(p['thickness_mm']) for p in parts}, key=float)
+    for key in detected_thicknesses:
+        group = QtWidgets.QGroupBox('%s mm sheet — size and machining clearances' % key)
+        grid = QtWidgets.QGridLayout(group)
+        controls = {}
+        fields = [('width_mm', 'Sheet length X', 2440.0, 1.0),
+                  ('height_mm', 'Sheet width Y', 1220.0, 1.0),
+                  ('margin_mm', 'Sheet edge margin', 10.0, 0.0),
+                  ('gap_mm', 'Gap between machining outlines', 10.0, 0.0),
+                  ('extension_mm', 'Extend open rebates past edges', 0.0, 0.0)]
+        for i, (field, label, default, minimum) in enumerate(fields):
+            box = QtWidgets.QDoubleSpinBox()
+            box.setRange(minimum, 100000 if field in ('width_mm', 'height_mm') else 1000)
+            box.setDecimals(2)
+            box.setKeyboardTracking(False)
+            box.setSuffix(' mm')
+            box.setValue(default)
+            controls[field] = box
+            row, col = i // 3, (i % 3) * 2
+            grid.addWidget(QtWidgets.QLabel(label), row, col)
+            grid.addWidget(box, row, col + 1)
+        controls['extension_mm'].setToolTip('0 = off. Extension for %s mm panels only; the per-part checkbox can exclude a panel.' % key)
+        controls['gap_mm'].setToolTip('Clear space between machining envelopes for this thickness, including rebate extensions. Set for your tooling.')
+        sheet_grain = QtWidgets.QComboBox()
+        sheet_grain.addItem('Along length X', 'X')
+        sheet_grain.addItem('Along width Y', 'Y')
+        grid.addWidget(QtWidgets.QLabel('Sheet grain'), 1, 4)
+        grid.addWidget(sheet_grain, 1, 5)
+        stock_controls[key] = {'values': controls, 'grain': sheet_grain}
+        layout.addWidget(group)
+    legend = QtWidgets.QLabel('Click a colour button or double-click a layer name below the preview to edit it. Matching holes share one layer; depths stay unchanged.\nNominal 8 × 4 ft default: 2440 × 1220 mm. Different thicknesses use separate sheets. No automatic rotation or irregular-shape nesting.')
+    legend.setWordWrap(True)
+    layout.addWidget(legend)
+    scene = QtWidgets.QGraphicsScene(dialog)
+    view = QtWidgets.QGraphicsView(scene)
+    view.setObjectName('MestraSheetGraphicsPreview')
+    view.setMinimumHeight(260)
+    view.setRenderHint(QtGui.QPainter.Antialiasing)
+    view.setBackgroundBrush(QtGui.QBrush(QtGui.QColor('white')))
+    layout.addWidget(view, 1)
+    colour_key = QtWidgets.QTableWidget(0, 3)
+    colour_key.setHorizontalHeaderLabels(['Colour', 'Layer name — double-click to edit', 'Features'])
+    colour_key.verticalHeader().setVisible(False)
+    colour_key.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+    colour_key.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+    colour_key.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
+    colour_key.setEditTriggers(QtWidgets.QAbstractItemView.DoubleClicked | QtWidgets.QAbstractItemView.EditKeyPressed)
+    colour_key.setMaximumHeight(145)
+    layout.addWidget(colour_key)
+    preview_file = QtWidgets.QCheckBox('Save and open the sheet layout in a new FreeCAD document after export')
+    preview_file.setChecked(True)
+    outer_layout.addWidget(preview_file)
+    button_row = QtWidgets.QHBoxLayout()
+    update = QtWidgets.QPushButton('Update sheet preview')
+    button_row.addWidget(update)
+    auto_preview = QtWidgets.QCheckBox('Automatically update preview')
+    auto_preview.setChecked(True)
+    auto_preview.setToolTip('Preview draws when the window opens and refreshes after a 0.5-second pause when parts, flip, rotation, quantities or sheet settings change.')
+    button_row.addWidget(auto_preview)
+    button_row.addStretch()
+    buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+    buttons.button(QtWidgets.QDialogButtonBox.Ok).setText('Export sheet DXFs…')
+    buttons.rejected.connect(dialog.reject)
+    button_row.addWidget(buttons)
+    outer_layout.addLayout(button_row)
+    chosen_result = {}
+    orientation_sources=[p.get('_unoriented_part',p) for p in parts]
+    initial_palette = palette_for_parts(orientation_sources)
+    sources = {op['layer'] for part in orientation_sources for op in part['operations']}
+    layer_settings = {key: {'name': key, 'hex': value['hex']} for key, value in initial_palette.items() if key in sources}
+    preview_state = {'busy': False, 'dirty': True, 'cached': None, 'picking_colour': False}
+    auto_timer = QtCore.QTimer(dialog)
+    auto_timer.setSingleShot(True)
+    style_timer = QtCore.QTimer(dialog)
+    style_timer.setSingleShot(True)
+
+    def build():
+        settings = {'by_thickness': {}}
+        configured = []
+        for row, part in enumerate(parts):
+            quantity = quantities[row].value()
+            if table.item(row, 0).checkState() != QtCore.Qt.Checked or quantity == 0:
+                continue
+            if len(configured) + quantity > 5000:
+                raise ExportError('This batch exceeds 5,000 panels. Split it into smaller exports.')
+            key = thickness_key(part['thickness_mm'])
+            if key not in settings['by_thickness']:
+                widgets = stock_controls[key]
+                values = {name: control.value() for name, control in widgets['values'].items()}
+                values['grain_axis'] = widgets['grain'].currentData()
+                try:
+                    settings['by_thickness'][key] = sheet_settings(values)
+                except Exception as exc:
+                    raise ExportError('%s mm sheet settings: %s' % (key, exc)) from exc
+            profile = settings['by_thickness'][key]
+            amount = profile['extension_mm'] if extend_boxes[row].isChecked() else 0
+            try:
+                configured_part = apply_part_options(part, rotations[row].currentData(), grains[row].currentData(), amount, face_flips[row].isChecked())
+                configured.extend(expand_quantity(configured_part, quantity, row + 1))
+            except Exception as exc:
+                raise ExportError('%s: %s' % (part['label'], exc)) from exc
+        configured = apply_layer_settings(configured, layer_settings)
+        return configured, settings, pack_sheets(configured, settings)
+
+
+    def pen(colour, width=1.2):
+        value = QtGui.QPen(QtGui.QColor(colour))
+        value.setWidthF(width)
+        value.setCosmetic(True)
+        return value
+
+    def render(sheets, settings):
+        scene.clear()
+        palette = palette_for_parts([p['part'] for sheet in sheets for p in sheet['placements']])
+        refresh_layer_key([p['part'] for sheet in sheets for p in sheet['placements']])
+        top = 0.0
+        for sheet in sheets:
+            sheet_profile = sheet['stock_settings']
+            width, height = sheet['width_mm'], sheet['height_mm']
+            for side in ['FRONT'] + (['BACK'] if sheet['has_back'] else []):
+                scene.addRect(0, top, width, height, pen(palette['REFERENCE_SHEET']['hex']))
+                margin = sheet_profile['margin_mm']
+                if margin:
+                    scene.addRect(margin, top + margin, width - 2 * margin, height - 2 * margin, pen(palette['REFERENCE_MARGIN']['hex'], 0.8))
+                title = scene.addSimpleText('Sheet %02d · %s · %s mm · grain %s' % (sheet['index'], face_label(side), mm(sheet['thickness_mm']), sheet_profile['grain_axis']))
+                title.setScale(max(width, height) / 1200)
+                title.setPos(0, top - max(width, height) / 35)
+                for placement in sheet['placements']:
+                    part = placement['part']
+                    for op in face_operations(part, side):
+                        colour = palette[op['layer']]['hex']
+                        for source_wire in op['face'].Wires:
+                            wire = placed_wire(source_wire, placement, sheet, side)
+                            for edge in wire.Edges:
+                                if edge.Length <= TOL:
+                                    continue
+                                path = QtGui.QPainterPath()
+                                count = 1 if isinstance(edge.Curve, Part.Line) else 96
+                                for i in range(count + 1):
+                                    p = edge.valueAt(edge.FirstParameter + (edge.LastParameter - edge.FirstParameter) * i / count)
+                                    point = QtCore.QPointF(p.x, top + height - p.y)
+                                    if i == 0:
+                                        path.moveTo(point)
+                                    else:
+                                        path.lineTo(point)
+                                scene.addPath(path, pen(colour))
+                    x = placement['x_mm'] if side == 'FRONT' else width - placement['x_mm'] - part['width_mm']
+                    y = placement['y_mm']
+                    for a, b in grain_segments(x, y, part['width_mm'], part['height_mm'], part['grain_axis_on_sheet']):
+                        scene.addLine(a[0], top + height - a[1], b[0], top + height - b[1], pen(palette['REFERENCE_GRAIN']['hex']))
+                    label = scene.addSimpleText('%02d %s (%d°)' % (placement['part_index'], part['label'], part['rotation_deg']))
+                    label.setBrush(QtGui.QBrush(QtGui.QColor('#555555')))
+                    # Scale the entire label to fit inside even a narrow part.
+                    text_width = max(1, label.boundingRect().width())
+                    label.setScale(min(1.4, part['width_mm'] * 0.8 / text_width, part['height_mm'] / 35))
+                    label.setPos(x + 3, top + height - y - part['height_mm'] + 3)
+                top += height + max(width, height) / 10
+        scene.setSceneRect(scene.itemsBoundingRect().adjusted(-20, -20, 20, 20))
+        view.fitInView(scene.sceneRect(), QtCore.Qt.KeepAspectRatio)
+
+    def refresh_layer_key(configured):
+        counts = {}
+        for part in configured:
+            for op in part['operations']:
+                source = op.get('source_layer', op['layer'])
+                counts[source] = counts.get(source, 0) + 1
+        sources = [key for key in layer_settings if key in counts]
+        was_blocked = colour_key.blockSignals(True)
+        try:
+            colour_key.setRowCount(len(sources))
+            for row, source in enumerate(sources):
+                style = layer_settings[source]
+                button = QtWidgets.QPushButton('Choose…')
+                colour = QtGui.QColor(style['hex'])
+                foreground = '#ffffff' if colour.lightness() < 140 else '#202020'
+                button.setStyleSheet('QPushButton { background-color: %s; color: %s; border: 1px solid #999; border-radius: 3px; padding: 3px 8px; }' % (style['hex'], foreground))
+                button.setToolTip('Change colour for %s' % style['name'])
+                button.clicked.connect(lambda _checked=False, key=source: choose_layer_colour(key))
+                colour_key.setCellWidget(row, 0, button)
+                name = QtWidgets.QTableWidgetItem(style['name'])
+                name.setData(QtCore.Qt.UserRole, source)
+                name.setToolTip('Original operation: %s\nRenaming changes the layer name, not its depth or diameter.' % source)
+                colour_key.setItem(row, 1, name)
+                count = QtWidgets.QTableWidgetItem(str(counts[source]))
+                count.setFlags(count.flags() & ~QtCore.Qt.ItemIsEditable)
+                colour_key.setItem(row, 2, count)
+        finally:
+            colour_key.blockSignals(was_blocked)
+
+    def refresh_styles():
+        focused = QtWidgets.QApplication.focusWidget()
+        editing_name = isinstance(focused, QtWidgets.QLineEdit) and colour_key.isAncestorOf(focused)
+        if preview_state['busy'] or preview_state['picking_colour'] or editing_name:
+            style_timer.start(150)
+            return
+        try:
+            cached = preview_state['cached']
+            if cached is not None and not preview_state['dirty']:
+                configured, settings = cached
+                configured = apply_layer_settings(configured, layer_settings)
+                # Only names/colours change here; no geometry extraction,
+                # rotation or rebate booleans are repeated.
+                sheets = pack_sheets(configured, settings)
+                render(sheets, settings)
+                preview_state['cached'] = (configured, settings)
+                status.setText('Layer names and colours updated. The export will use these settings.')
+            else:
+                refresh_layer_key(apply_layer_settings(parts, layer_settings))
+                if auto_preview.isChecked():
+                    auto_timer.start(500)
+                else:
+                    status.setText('Layer settings updated. Click Update sheet preview to refresh the geometry.')
+        except Exception as exc:
+            status.setText('Layer settings need attention: %s' % exc)
+            QtWidgets.QMessageBox.warning(dialog, 'Layer settings need attention', str(exc))
+
+    def choose_layer_colour(source):
+        auto_timer.stop()
+        style_timer.stop()
+        preview_state['picking_colour'] = True
+        try:
+            selected = QtWidgets.QColorDialog.getColor(QtGui.QColor(layer_settings[source]['hex']), dialog,
+                                                       'Colour for ' + layer_settings[source]['name'])
+            if selected.isValid():
+                layer_settings[source]['hex'] = selected.name().lower()
+                style_timer.start(0)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(dialog, 'Could not change layer colour', str(exc))
+        finally:
+            preview_state['picking_colour'] = False
+            if auto_preview.isChecked() and preview_state['dirty']:
+                auto_timer.start(500)
+
+    def layer_name_changed(item):
+        if item.column() != 1:
+            return
+        source = item.data(QtCore.Qt.UserRole)
+        if source not in layer_settings:
+            return
+        old_name = layer_settings[source]['name']
+        layer_settings[source]['name'] = item.text().strip()
+        try:
+            validate_layer_settings(layer_settings)
+        except Exception as exc:
+            layer_settings[source]['name'] = old_name
+            was_blocked = colour_key.blockSignals(True)
+            try:
+                item.setText(old_name)
+            finally:
+                colour_key.blockSignals(was_blocked)
+            QtWidgets.QMessageBox.warning(dialog, 'Layer name needs attention', str(exc))
+            return
+        # Defer rebuilding table cells until the edit callback has returned.
+        style_timer.start(0)
+
+
+    def update_preview(*args, automatic=False):
+        auto_timer.stop()
+        if automatic and not auto_preview.isChecked():
+            return None
+        focused = QtWidgets.QApplication.focusWidget()
+        editing_name = isinstance(focused, QtWidgets.QLineEdit) and colour_key.isAncestorOf(focused)
+        if preview_state['busy'] or preview_state['picking_colour'] or (automatic and editing_name):
+            if automatic and auto_preview.isChecked():
+                auto_timer.start(150)
+            return None
+        style_timer.stop()
+        error = None
+        preview_state['busy'] = True
+        update.setEnabled(False)
+        status.setText('Calculating sheet preview…')
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            configured, settings, sheets = build()
+            render(sheets, settings)
+            preview_state['cached'] = (configured, settings)
+            preview_state['dirty'] = False
+            extended = sum(p['extended_open_edges'] for p in configured)
+            underside_count=sum(p['underside_feature_count'] for p in configured)
+            status.setText('%d parts on %d UP sheet(s). %d open rebate edge(s) extended. All boundaries fit within the margins.%s' % (len(configured), len(sheets), extended, (' %d underside feature(s) remain in 3D and notes only.'%underside_count) if underside_count else ''))
+            return configured, settings
+        except Exception as exc:
+            scene.clear()
+            preview_state['dirty'] = True
+            status.setText('Layout needs attention: %s' % exc)
+            error = str(exc)
+            App.Console.PrintError('Mestra sheet preview: %s\n' % exc)
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            preview_state['busy'] = False
+            update.setEnabled(True)
+        # Automatic mode reports errors in the always-visible status area. It
+        # does not interrupt every intermediate edit with a modal warning.
+        if error is not None and not automatic:
+            QtWidgets.QMessageBox.warning(dialog, 'Sheet preview needs attention', error)
+        return None
+
+    def invalidate(*args):
+        preview_state['dirty'] = True
+        if auto_preview.isChecked():
+            status.setText('Settings changed — preview will update after a short pause…')
+            auto_timer.start(500)
+        else:
+            auto_timer.stop()
+            status.setText('Preview is out of date — click Update sheet preview. Export will check the current settings again.')
+
+    def automatic_changed(enabled):
+        auto_timer.stop()
+        if enabled:
+            status.setText('Automatic preview enabled — calculating shortly…')
+            auto_timer.start(500)
+        elif preview_state['dirty']:
+            status.setText('Automatic preview is off. Click Update sheet preview to show the current settings.')
+        else:
+            status.setText('Automatic preview is off. The current preview is up to date.')
+
+
+    def accept_export():
+        auto_timer.stop()
+        style_timer.stop()
+        raw_directory = directory_edit.text().strip()
+        if not raw_directory:
+            QtWidgets.QMessageBox.warning(dialog, 'Choose an export folder', 'Choose where to save the export using the Export folder field or Browse button.')
+            return
+        directory = Path(raw_directory).expanduser()
+        if not directory.is_absolute():
+            QtWidgets.QMessageBox.warning(dialog, 'Choose an export folder', 'Use Browse to select a folder, or enter its full path.')
+            return
+        if not directory.is_dir():
+            QtWidgets.QMessageBox.warning(dialog, 'Choose an existing folder', 'That folder does not exist or cannot be accessed. Use Browse to choose an existing folder.\n\n%s' % directory)
+            return
+        error = None
+        status.setText('Checking the layout for export…')
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            # Validate machining/layout independently of the on-screen drawing.
+            # A drawing-only failure must not masquerade as a failed export.
+            configured, settings, _sheets = build()
+        except Exception as exc:
+            error = str(exc)
+            App.Console.PrintError('Mestra export validation: %s\n' % exc)
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        if error is not None:
+            status.setText('Export stopped: %s' % error)
+            QtWidgets.QMessageBox.warning(dialog, 'Export stopped — no files saved', error)
+            return
+        chosen_result['parts'], chosen_result['settings'] = configured, settings
+        chosen_result['directory'] = str(directory)
+        chosen_result['create_preview'] = preview_file.isChecked()
+        dialog.accept()
+
+    def export_clicked():
+        # Qt invokes slots outside run()'s exception handler. Catch every error
+        # here too, otherwise an exception can look like an unresponsive button.
+        try:
+            accept_export()
+        except Exception as exc:
+            status.setText('Export stopped: %s' % exc)
+            App.Console.PrintError(traceback.format_exc() + '\n')
+            QtWidgets.QMessageBox.critical(dialog, 'Export stopped — no files saved', str(exc))
+
+    update.clicked.connect(update_preview)
+    auto_timer.timeout.connect(lambda: update_preview(automatic=True))
+    style_timer.timeout.connect(refresh_styles)
+    auto_preview.toggled.connect(automatic_changed)
+    colour_key.itemChanged.connect(layer_name_changed)
+    dialog.finished.connect(lambda *_: auto_timer.stop())
+    dialog.finished.connect(lambda *_: style_timer.stop())
+    buttons.accepted.connect(export_clicked)
+    for combo in rotations + grains + [widgets['grain'] for widgets in stock_controls.values()]:
+        combo.currentIndexChanged.connect(invalidate)
+    for widgets in stock_controls.values():
+        for control in widgets['values'].values():
+            control.valueChanged.connect(invalidate)
+    for quantity in quantities:
+        quantity.valueChanged.connect(invalidate)
+    for checkbox in extend_boxes + face_flips:
+        checkbox.toggled.connect(invalidate)
+    table.itemChanged.connect(invalidate)
+    refresh_layer_key(apply_layer_settings(parts, layer_settings))
+    # Paint once after the visible dialog has a real viewport, then refresh on edits.
+    auto_timer.start(100)
+    if dialog.exec() != QtWidgets.QDialog.Accepted:
+        return None
+    return chosen_result
+
+
+def show_export_result(destination, manifest, QtWidgets, QtCore, QtGui, parent):
+    """Make a completed export visible without confusing it with UI failures."""
+    import FreeCADGui as Gui
+    preview = manifest.get('preview', {})
+    preview_problem = preview.get('error')
+    opened_preview = False
+    if preview.get('created'):
+        path = destination / preview['file']
+        try:
+            if not path.is_file():
+                raise ExportError('The saved preview file could not be found: %s' % path)
+            document = App.openDocument(str(path))
+            if document is None:
+                raise ExportError('FreeCAD did not return a document for the saved preview.')
+            App.setActiveDocument(document.Name)
+            Gui.activeDocument().activeView().viewTop()
+            Gui.activeDocument().activeView().fitAll()
+            opened_preview = True
+        except Exception as exc:
+            preview_problem = str(exc)
+            App.Console.PrintWarning('Mestra DXFs are saved, but opening the sheet preview failed: %s\n' % exc)
+    box = QtWidgets.QMessageBox(parent)
+    box.setWindowTitle('Plywood export saved')
+    box.setIcon(QtWidgets.QMessageBox.Warning if preview_problem else QtWidgets.QMessageBox.Information)
+    box.setText('%d parts saved on %d sheet(s).' % (len(manifest['parts']), len(manifest['sheets'])))
+    info = 'Export location:\n%s\n\nUse Sheet_*.dxf for the sheet contours. Open Flat_parts.FCStd for the exact laid-flat plywood parts. Individual STEP files retain the full 3D cuts.' % destination
+    if opened_preview:
+        info += '\n\nThe sheet layout is now open in a new FreeCAD document. Close this message to view it.'
+    elif preview_problem:
+        info += '\n\nThe DXFs were saved, but the FreeCAD preview could not be opened:\n%s' % preview_problem
+    else:
+        info += '\n\nThe FreeCAD preview option was unchecked; only the export files were saved.'
+    box.setInformativeText(info)
+    filenames = [name for sheet in manifest['sheets'] for name in sheet['files']]
+    box.setDetailedText('\n'.join(filenames))
+    box.setStandardButtons(QtWidgets.QMessageBox.Ok)
+    folder_button = box.addButton('Open export folder', QtWidgets.QMessageBox.ActionRole)
+
+    def open_folder(*args):
+        try:
+            if not destination.is_dir():
+                raise ExportError('The export folder could not be found.')
+            if not QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(destination))):
+                raise ExportError('The system did not open the folder. You can copy the export location shown in this message.')
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(box, 'Could not open the folder', str(exc))
+
+    folder_button.clicked.connect(open_folder)
+    App.Console.PrintMessage('Mestra Flat Export saved: %s\n' % destination)
+    box.exec()
+
+
+def run():
+    import FreeCADGui as Gui
+    try:
+        from PySide import QtWidgets, QtCore, QtGui
+    except ImportError:
+        from PySide2 import QtWidgets, QtCore, QtGui
+    parent = Gui.getMainWindow()
+    doc = App.ActiveDocument
+    if doc is None:
+        QtWidgets.QMessageBox.information(parent, 'Mestra Flat Export', 'Open a FreeCAD model first.')
+        return
+    try:
+        if doc.getObject('MestraSheetExportMarker') is not None:
+            raise ExportError('This is an export preview. Switch to your original model before running the macro.')
+        skipped=[]
+        candidates = collect_manufacturing_parts(doc, Gui.Selection.getSelectionEx(), skipped)
+        candidates = choose_plywood_parts(candidates, skipped, QtWidgets, QtCore, parent)
+        if candidates is None:
+            return
+        parts, failures = [], []
+        parent.statusBar().showMessage('Reading individual panels…')
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            for candidate in candidates:
+                shape = candidate['shape']
+                for index, solid in enumerate(shape.Solids, 1):
+                    label = candidate['label']
+                    if len(shape.Solids) > 1:
+                        label += '_%02d' % index
+                    try:
+                        part = select_machining_face(analyse_solid(solid, label, candidate['normal']))
+                        part['source_object'] = candidate['source_object']
+                        part['source_document'] = candidate['source_document']
+                        part['source_instance'] = candidate['source_instance']
+                        parts.append(part)
+                    except Exception as exc:
+                        failures.append('%s: %s' % (label, exc))
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            parent.statusBar().clearMessage()
+        if failures:
+            raise ExportError('No files were exported. These selected parts need attention. You can run again and untick them in the part picker:\n\n' + '\n\n'.join(failures))
+        if not parts:
+            raise ExportError('No solid parts were found.')
+        choice = configure_parts(parts, QtWidgets, QtCore, QtGui, parent)
+        if choice is None:
+            return
+        directory = choice['directory']
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        parent.statusBar().showMessage('Writing sheet DXFs…')
+        try:
+            destination, manifest = output_parts(choice['parts'], directory, doc.Label,
+                create_preview=choice['create_preview'], settings=choice['settings'])
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            parent.statusBar().clearMessage()
+        show_export_result(destination, manifest, QtWidgets, QtCore, QtGui, parent)
+    except ExportError as exc:
+        App.Console.PrintError('Mestra Flat Export: %s\n' % exc)
+        QtWidgets.QMessageBox.warning(parent, 'Export needs attention', str(exc))
+    except Exception as exc:
+        App.Console.PrintError(traceback.format_exc() + '\n')
+        QtWidgets.QMessageBox.critical(parent, 'Export failed', 'The export could not be completed. Your source model was not changed.\n\n%s\n\nSee View → Panels → Report View for details.' % exc)
+
+
+if __name__ == '__main__':
+    run()

@@ -1,0 +1,58 @@
+# -*- coding: utf-8 -*-
+"""Tag selected CAD components as panels, or clear their tags. Geometry is unchanged."""
+from pathlib import Path
+import runpy
+import traceback
+import FreeCAD as App
+import FreeCADGui as Gui
+from PySide import QtWidgets
+
+
+def exporter_path():
+    local = Path(globals().get('__file__', '')).resolve().parent / 'Mestra_Flat_Export.FCMacro'
+    installed = Path(App.ParamGet('User parameter:BaseApp/Preferences/Macro').GetString('MacroPath', App.getUserMacroDir(True))) / 'Mestra_Flat_Export.FCMacro'
+    for path in [local, installed]:
+        if path.is_file():return path
+    raise RuntimeError('Mestra_Flat_Export.FCMacro is missing. Run Install_Mestra_Lay_Flat.FCMacro from the extracted download.')
+
+
+def run():
+    parent = Gui.getMainWindow()
+    try:
+        doc = App.ActiveDocument
+        if doc is None:raise ValueError('Open a model and select one or more finished parts first.')
+        api = runpy.run_path(str(exporter_path()), run_name='mestra_panel_tag_library')
+        objects = api['selected_panel_objects'](doc, Gui.Selection.getSelectionEx())
+        dialog = QtWidgets.QDialog(parent)
+        dialog.setWindowTitle('Panel tags')
+        dialog.resize(560, 360)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        note = QtWidgets.QLabel('Tag these components as panels to preselect them in Lay Flat. '
+                                'The final export list stays editable. Geometry will not change.')
+        note.setWordWrap(True);layout.addWidget(note)
+        listing = QtWidgets.QListWidget()
+        for obj in objects:
+            state = 'Panel' if api['is_tagged_panel'](obj) else 'Not tagged'
+            listing.addItem('%s — %s' % (obj.Label, state))
+        layout.addWidget(listing)
+        note = QtWidgets.QLabel('A tag applies to every solid and placement sharing this component. '
+                                'Save the FreeCAD model (.FCStd) to keep the tags.')
+        note.setWordWrap(True);layout.addWidget(note)
+        controls = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Cancel)
+        tag = controls.addButton('Tag as panels', QtWidgets.QDialogButtonBox.AcceptRole)
+        clear = controls.addButton('Remove panel tags', QtWidgets.QDialogButtonBox.ActionRole)
+        choice = {'value': None}
+        def choose(value):choice['value'] = value;dialog.accept()
+        tag.clicked.connect(lambda:choose(True));clear.clicked.connect(lambda:choose(False))
+        controls.rejected.connect(dialog.reject);layout.addWidget(controls)
+        if dialog.exec() != QtWidgets.QDialog.Accepted:return
+        api['set_panel_tags'](doc, objects, choice['value'])
+        message = '%d component(s) %s. Save the model to keep this change.' % (len(objects), 'tagged as panels' if choice['value'] else 'untagged')
+        parent.statusBar().showMessage(message, 12000)
+        App.Console.PrintMessage(message + '\n')
+    except Exception as error:
+        App.Console.PrintError('Panel tags: %s\n' % error)
+        QtWidgets.QMessageBox.warning(parent, 'Panel tags need attention', str(error))
+
+
+if __name__ == '__main__':run()

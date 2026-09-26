@@ -1,0 +1,138 @@
+# -*- coding: utf-8 -*-
+"""Install the portable Mestra Lay Flat and Panel Tags macros into this FreeCAD profile."""
+from pathlib import Path
+from datetime import datetime, timezone
+import os
+import shutil
+import tempfile
+import FreeCAD as App
+import FreeCADGui as Gui
+from PySide import QtWidgets
+
+FILES = ('Mestra_Flat_Export.FCMacro', 'Mestra_Panel_Tags.FCMacro',
+         'mestra-lay-flat.svg', 'mestra-panel-tags.svg')
+COMMANDS = (
+    ('Mestra_Flat_Export.FCMacro', 'Lay Flat', 'Choose parts and export flat sheet layouts', 'mestra-lay-flat.svg'),
+    ('Mestra_Panel_Tags.FCMacro', 'Panel Tags', 'Tag selected components as panels, or remove their tags', 'mestra-panel-tags.svg'),
+)
+
+
+def find_package():
+    filename = globals().get('__file__')
+    if filename:
+        folder = Path(filename).resolve().parent
+        if all((folder / name).is_file() for name in FILES):return folder
+    chosen = QtWidgets.QFileDialog.getExistingDirectory(Gui.getMainWindow(), 'Choose the extracted Mestra Lay Flat download')
+    if not chosen:return None
+    folder = Path(chosen)
+    if not all((folder / name).is_file() for name in FILES):
+        raise ValueError('That folder is incomplete. Extract the whole ZIP and choose the folder containing all the macros and icons.')
+    return folder
+
+
+def install(folder):
+    folder = Path(folder).resolve()
+    destination = Path(App.ParamGet('User parameter:BaseApp/Preferences/Macro').GetString('MacroPath', App.getUserMacroDir(True))).expanduser().resolve()
+    destination.mkdir(parents=True, exist_ok=True)
+    if not hasattr(Gui.Command, 'createCustomCommand'):
+        raise ValueError('This FreeCAD build lacks the macro-toolbar API. Use a FreeCAD 1.1 build, or follow the manual installation instructions.')
+    for name in FILES:
+        source = folder / name
+        if not source.is_file():raise ValueError('Download is missing ' + name)
+        if name.endswith('.FCMacro'):compile(source.read_text(encoding='utf-8'), str(source), 'exec')
+    backup = None
+    old_files = {}
+    copied = []
+    command_names = []
+    created_commands = []
+    macros = App.ParamGet('User parameter:BaseApp/Macro/Macros')
+    toolbars = App.ParamGet('User parameter:BaseApp/Workbench/Global/Toolbar')
+    toolbar_group = next((name for name in toolbars.GetGroups()
+                          if toolbars.GetGroup(name).GetString('Name') == 'Mestra'), None)
+    created_toolbar = toolbar_group is None
+    if toolbar_group is None:
+        index = 1
+        while 'Custom_%d' % index in toolbars.GetGroups():index += 1
+        toolbar_group = 'Custom_%d' % index
+    # Copy first, preserving older versions. No unrelated macro is replaced.
+    try:
+        for name in FILES:
+            target = destination / name
+            content = (folder / name).read_bytes()
+            if target.is_file() and target.read_bytes() == content:continue
+            old_files[name] = target.read_bytes() if target.exists() else None
+            if target.exists():
+                if backup is None:
+                    backup = destination / 'Mestra-Lay-Flat-backups' / datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S-%f')
+                    backup.mkdir(parents=True)
+                shutil.copy2(target, backup / name)
+            fd, temporary = tempfile.mkstemp(prefix='.' + name, suffix='.installing', dir=str(destination))
+            try:
+                with os.fdopen(fd, 'wb') as stream:stream.write(content)
+                os.replace(temporary, target)
+            finally:
+                if os.path.exists(temporary):os.unlink(temporary)
+            copied.append(name)
+        toolbar = toolbars.GetGroup(toolbar_group)
+        toolbar.SetString('Name', 'Mestra');toolbar.SetBool('Active', True)
+        for filename, label, tooltip, icon in COMMANDS:
+            command = Gui.Command.findCustomCommand(filename)
+            if command is None:
+                command = Gui.Command.createCustomCommand(filename, menuText=label, toolTip=tooltip,
+                    whatsThis=tooltip, statusTip=tooltip, pixmap=str(destination / icon))
+                created_commands.append(command)
+            info = Gui.Command.get(command).getInfo()
+            params = macros.GetGroup(command)
+            for key, value in {'Script': filename, 'Menu': info['menuText'], 'Tooltip': info['toolTip'],
+                               'WhatsThis': info['whatsThis'], 'Statustip': info['statusTip'],
+                               'Pixmap': info['pixmap'], 'Accel': info['shortcut']}.items():
+                params.SetString(key, value)
+            params.SetBool('System', False)
+            toolbar.SetString(command, 'FreeCAD')
+            command_names.append(command)
+        App.saveParameter()
+    except Exception:
+        for name in copied:
+            target = destination / name
+            if old_files[name] is None:target.unlink(missing_ok=True)
+            else:target.write_bytes(old_files[name])
+        for command in created_commands:
+            Gui.Command.removeCustomCommand(command)
+            macros.RemGroup(command)
+            toolbars.GetGroup(toolbar_group).RemString(command)
+        if created_toolbar:toolbars.RemGroup(toolbar_group)
+        App.saveParameter()
+        raise
+    # Apply the saved toolbar without restarting or interrupting an active edit.
+    refresh_error = None
+    current = Gui.activeWorkbench().name()
+    try:
+        editing = Gui.activeDocument().getInEdit() if Gui.activeDocument() else None
+        if editing is None:
+            Gui.activateWorkbench('PartWorkbench' if current != 'PartWorkbench' else 'PartDesignWorkbench')
+            Gui.activateWorkbench(current)
+        else:refresh_error = 'Finish the current edit, then switch workbenches or restart FreeCAD to show the buttons.'
+        Gui.Command.update();App.saveParameter()
+    except Exception as error:
+        refresh_error = 'The files and settings are installed. Restart FreeCAD to show the toolbar. ' + str(error)
+        try:Gui.activateWorkbench(current)
+        except Exception:pass
+    return {'folder': str(destination), 'commands': command_names,
+            'backup': str(backup) if backup else None, 'toolbar_note': refresh_error}
+
+
+def run():
+    try:
+        folder = find_package()
+        if folder is None:return
+        result = install(folder)
+        text = 'Installed Lay Flat and Panel Tags in the Mestra toolbar.\n\n' + result['folder']
+        if result['backup']:text += '\n\nPrevious files were backed up to:\n' + result['backup']
+        if result['toolbar_note']:text += '\n\n' + result['toolbar_note']
+        QtWidgets.QMessageBox.information(Gui.getMainWindow(), 'Mestra Lay Flat installed', text)
+    except Exception as error:
+        App.Console.PrintError('Mestra Lay Flat installation failed: %s\n' % error)
+        QtWidgets.QMessageBox.critical(Gui.getMainWindow(), 'Installation failed', str(error))
+
+
+if __name__ == '__main__':run()
