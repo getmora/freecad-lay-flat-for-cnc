@@ -2,6 +2,8 @@
 
 A portable FreeCAD macro bundle for tagging panels, choosing parts manually, and exporting flat sheet layouts. It works from solid CAD geometry, including imported STEP parts. No Mestra cabinet template or customer model is included or required.
 
+**[Download the complete ZIP](https://github.com/getmora/mestra-lay-flat/releases/download/v0.12.0/Mestra-Lay-Flat-0.12.0.zip)** · [Release notes](https://github.com/getmora/mestra-lay-flat/releases/tag/v0.12.0)
+
 ## Install
 
 1. Extract the entire ZIP into a folder. Keep the macros and SVG icons together.
