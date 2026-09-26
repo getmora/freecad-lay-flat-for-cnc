@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Mestra Flat Export 0.12 -- self-contained FreeCAD macro, millimetres.
+"""FreeCAD Lay Flat for CNC 0.12.2 -- self-contained FreeCAD macro, millimetres.
 
 Run in FreeCAD. Select finished Bodies/parts (optional); otherwise the dialog
 lists Bodies. Each solid is one part. Source objects are never changed.
@@ -25,7 +25,7 @@ from pathlib import Path
 import FreeCAD as App
 import Part
 
-VERSION = '0.12.1'
+VERSION = '0.12.2'
 PANEL_TAG = 'LayFlatPanel'
 STOCK_THICKNESS_TOL = 0.05
 TOL = 1e-5
@@ -1255,7 +1255,7 @@ def sheet_drawing(sheet, side, settings, palette=None):
     return drawing
 
 
-def output_parts(parts, parent, title='Mestra', create_preview=True, settings=None):
+def output_parts(parts, parent, title='FreeCAD_Lay_Flat_for_CNC', create_preview=True, settings=None):
     """Write individual DXFs and bounded sheet DXFs into a fresh directory."""
     # Preserve the callable API for callers supplying unconfigured analysed parts.
     parts = [p if 'machining_bounds_mm' in p else apply_part_options(p) for p in parts]
@@ -1266,7 +1266,7 @@ def output_parts(parts, parent, title='Mestra', create_preview=True, settings=No
     if not parent.is_dir():
         raise ExportError('Choose an existing output folder.')
     final_name = '%s_sheets_%s' % (safe_name(title), datetime.now().strftime('%Y%m%d_%H%M%S_%f'))
-    staging = Path(tempfile.mkdtemp(prefix='.mestra-export-', dir=str(parent)))
+    staging = Path(tempfile.mkdtemp(prefix='.freecad-lay-flat-', dir=str(parent)))
     manifest = {'exporter_version': VERSION, 'units': 'mm', 'title': title,
                 'depth_datum': 'UP operation depths are measured from the original upward stock surface. Reported underside depths are measured from the opposite stock surface.',
                 'machining_face': 'Each panel is oriented with its most recessed machining features UP. Only this setup is drawn; underside features are reported separately.',
@@ -1378,7 +1378,7 @@ def output_parts(parts, parent, title='Mestra', create_preview=True, settings=No
                 # DXF generation succeeded: report an optional preview failure
                 # separately instead of discarding the user's valid exports.
                 manifest['preview']['error'] = str(exc)
-                App.Console.PrintWarning('Mestra DXFs created, but the FreeCAD preview failed: %s\n' % exc)
+                App.Console.PrintWarning('Lay Flat for CNC DXFs created, but the FreeCAD preview failed: %s\n' % exc)
                 if preview_path.exists():
                     preview_path.unlink()
         (staging / 'manifest.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
@@ -1395,10 +1395,10 @@ def save_sheet_preview(sheets, settings, path, palette=None):
     if palette is None:
         palette = palette_for_parts([p['part'] for sheet in sheets for p in sheet['placements']])
     previous = App.ActiveDocument
-    doc = App.newDocument('MestraSheetPreview')
+    doc = App.newDocument('FreeCADLayFlatSheetPreview')
     try:
-        doc.Label = 'Mestra sheet layout'
-        marker = doc.addObject('App::FeaturePython', 'MestraSheetExportMarker')
+        doc.Label = 'FreeCAD Lay Flat for CNC — sheet layout'
+        marker = doc.addObject('App::FeaturePython', 'FreeCADLayFlatSheetExportMarker')
         marker.Label = 'Export preview — use the original model for new exports'
         drawings = doc.addObject('App::DocumentObjectGroup', 'SheetLayouts')
         drawings.Label = 'Sheet layouts — DXF lines'
@@ -1820,7 +1820,7 @@ def build_part_picker(candidates, skipped, QtWidgets, QtCore, parent):
     intro.setWordWrap(True);layout.addWidget(intro)
     search = QtWidgets.QLineEdit();search.setPlaceholderText('Find a part…');layout.addWidget(search)
     table = QtWidgets.QTableWidget(len(candidates), 3)
-    table.setObjectName('MestraPlywoodPartPicker')
+    table.setObjectName('FreeCADLayFlatPlywoodPartPicker')
     table.setHorizontalHeaderLabels(['Part: checked = include', 'Panel tag', 'Current 3D size (mm)'])
     table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
     for col in [1, 2]:table.horizontalHeader().setSectionResizeMode(col, QtWidgets.QHeaderView.ResizeToContents)
@@ -1911,10 +1911,10 @@ def choose_plywood_parts(candidates, skipped, QtWidgets, QtCore, parent):
 
 def save_flat_solids(sheets, path):
     """Standalone exact solids, grouped by sheet, with no external dependencies."""
-    previous=App.ActiveDocument;doc=App.newDocument('MestraFlatPlywood')
+    previous=App.ActiveDocument;doc=App.newDocument('FreeCADLayFlatFlatPlywood')
     try:
-        doc.Label='Mestra plywood — laid flat'
-        marker=doc.addObject('App::FeaturePython','MestraSheetExportMarker');marker.Label='Export copy — source model unchanged'
+        doc.Label='FreeCAD Lay Flat for CNC — flat panels'
+        marker=doc.addObject('App::FeaturePython','FreeCADLayFlatSheetExportMarker');marker.Label='Export copy — source model unchanged'
         offset_y=0.0
         for sheet in sheets:
             group=doc.addObject('App::DocumentObjectGroup','StockSheet')
@@ -1950,7 +1950,7 @@ def cut_annotations(part, side):
 def configure_parts(parts, QtWidgets, QtCore, QtGui, parent):
     parts = [select_machining_face(p) for p in parts]
     dialog = QtWidgets.QDialog(parent)
-    dialog.setWindowTitle('Mestra Flat Export %s — grain, rebates and sheets' % VERSION)
+    dialog.setWindowTitle('FreeCAD Lay Flat for CNC %s — grain, rebates and sheets' % VERSION)
     screen = parent.screen()
     available = screen.availableGeometry() if screen is not None else None
     dialog.resize(min(1120, int(available.width() * 0.9)) if available else 1120,
@@ -1980,10 +1980,10 @@ def configure_parts(parts, QtWidgets, QtCore, QtGui, parent):
     outer_layout.addWidget(status)
     scroll = QtWidgets.QScrollArea(dialog)
     scroll.setWidgetResizable(True)
-    scroll.setObjectName('MestraExportScroll')
-    scroll.setStyleSheet('QScrollArea#MestraExportScroll { background-color: #f5f5f5; border: 1px solid #d0d0d0; }')
+    scroll.setObjectName('FreeCADLayFlatExportScroll')
+    scroll.setStyleSheet('QScrollArea#FreeCADLayFlatExportScroll { background-color: #f5f5f5; border: 1px solid #d0d0d0; }')
     content = QtWidgets.QWidget()
-    content.setObjectName('MestraExportContent')
+    content.setObjectName('FreeCADLayFlatExportContent')
     content.setAutoFillBackground(True)
     content_palette = content.palette()
     content_palette.setColor(QtGui.QPalette.Window, QtGui.QColor('#f5f5f5'))
@@ -1992,7 +1992,7 @@ def configure_parts(parts, QtWidgets, QtCore, QtGui, parent):
     # Scope colours to this macro's scroll content, not FreeCAD's global theme.
     # Tables/inputs keep their native control styling and layer swatches.
     content.setStyleSheet('''
-        QWidget#MestraExportContent { background-color: #f5f5f5; color: #202020; }
+        QWidget#FreeCADLayFlatExportContent { background-color: #f5f5f5; color: #202020; }
         QLabel { background-color: transparent; color: #202020; }
         QGroupBox { color: #202020; background-color: #f5f5f5; }
         QCheckBox { color: #202020; }
@@ -2053,7 +2053,7 @@ def configure_parts(parts, QtWidgets, QtCore, QtGui, parent):
         table.setCellWidget(row, 5, extend)
         extend_boxes.append(extend)
         flip=QtWidgets.QCheckBox('Flip')
-        flip.setObjectName('MestraFlipPart%d'%row)
+        flip.setObjectName('FreeCADLayFlatFlipPart%d'%row)
         flip.setToolTip('Turn this part over from the automatic most-recessed-face-up orientation. Rotation in the flat view is unchanged.')
         table.setCellWidget(row,6,flip);face_flips.append(flip)
     table.setMinimumHeight(170)
@@ -2095,7 +2095,7 @@ def configure_parts(parts, QtWidgets, QtCore, QtGui, parent):
     layout.addWidget(legend)
     scene = QtWidgets.QGraphicsScene(dialog)
     view = QtWidgets.QGraphicsView(scene)
-    view.setObjectName('MestraSheetGraphicsPreview')
+    view.setObjectName('FreeCADLayFlatSheetGraphicsPreview')
     view.setMinimumHeight(260)
     view.setRenderHint(QtGui.QPainter.Antialiasing)
     view.setBackgroundBrush(QtGui.QBrush(QtGui.QColor('white')))
@@ -2346,7 +2346,7 @@ def configure_parts(parts, QtWidgets, QtCore, QtGui, parent):
             preview_state['dirty'] = True
             status.setText('Layout needs attention: %s' % exc)
             error = str(exc)
-            App.Console.PrintError('Mestra sheet preview: %s\n' % exc)
+            App.Console.PrintError('Lay Flat for CNC sheet preview: %s\n' % exc)
         finally:
             QtWidgets.QApplication.restoreOverrideCursor()
             preview_state['busy'] = False
@@ -2400,7 +2400,7 @@ def configure_parts(parts, QtWidgets, QtCore, QtGui, parent):
             configured, settings, _sheets = build()
         except Exception as exc:
             error = str(exc)
-            App.Console.PrintError('Mestra export validation: %s\n' % exc)
+            App.Console.PrintError('Lay Flat for CNC export validation: %s\n' % exc)
         finally:
             QtWidgets.QApplication.restoreOverrideCursor()
         if error is not None:
@@ -2468,7 +2468,7 @@ def show_export_result(destination, manifest, QtWidgets, QtCore, QtGui, parent):
             opened_preview = True
         except Exception as exc:
             preview_problem = str(exc)
-            App.Console.PrintWarning('Mestra DXFs are saved, but opening the sheet preview failed: %s\n' % exc)
+            App.Console.PrintWarning('Lay Flat for CNC DXFs are saved, but opening the sheet preview failed: %s\n' % exc)
     box = QtWidgets.QMessageBox(parent)
     box.setWindowTitle('Plywood export saved')
     box.setIcon(QtWidgets.QMessageBox.Warning if preview_problem else QtWidgets.QMessageBox.Information)
@@ -2496,7 +2496,7 @@ def show_export_result(destination, manifest, QtWidgets, QtCore, QtGui, parent):
             QtWidgets.QMessageBox.warning(box, 'Could not open the folder', str(exc))
 
     folder_button.clicked.connect(open_folder)
-    App.Console.PrintMessage('Mestra Flat Export saved: %s\n' % destination)
+    App.Console.PrintMessage('FreeCAD Lay Flat for CNC saved: %s\n' % destination)
     box.exec()
 
 
@@ -2509,10 +2509,10 @@ def run():
     parent = Gui.getMainWindow()
     doc = App.ActiveDocument
     if doc is None:
-        QtWidgets.QMessageBox.information(parent, 'Mestra Flat Export', 'Open a FreeCAD model first.')
+        QtWidgets.QMessageBox.information(parent, 'FreeCAD Lay Flat for CNC', 'Open a FreeCAD model first.')
         return
     try:
-        if doc.getObject('MestraSheetExportMarker') is not None:
+        if doc.getObject('FreeCADLayFlatSheetExportMarker') is not None or doc.getObject('MestraSheetExportMarker') is not None:
             raise ExportError('This is an export preview. Switch to your original model before running the macro.')
         skipped=[]
         candidates = collect_manufacturing_parts(doc, Gui.Selection.getSelectionEx(), skipped)
@@ -2558,7 +2558,7 @@ def run():
             parent.statusBar().clearMessage()
         show_export_result(destination, manifest, QtWidgets, QtCore, QtGui, parent)
     except ExportError as exc:
-        App.Console.PrintError('Mestra Flat Export: %s\n' % exc)
+        App.Console.PrintError('FreeCAD Lay Flat for CNC: %s\n' % exc)
         QtWidgets.QMessageBox.warning(parent, 'Export needs attention', str(exc))
     except Exception as exc:
         App.Console.PrintError(traceback.format_exc() + '\n')

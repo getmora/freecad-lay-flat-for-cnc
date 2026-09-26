@@ -8,11 +8,11 @@ from PySide import QtCore, QtWidgets
 
 
 def exporter_path():
-    local = Path(globals().get('__file__', '')).resolve().parent / 'Mestra_Flat_Export.FCMacro'
-    installed = Path(App.ParamGet('User parameter:BaseApp/Preferences/Macro').GetString('MacroPath', App.getUserMacroDir(True))) / 'Mestra_Flat_Export.FCMacro'
+    local = Path(globals().get('__file__', '')).resolve().parent / 'FreeCAD_Lay_Flat_for_CNC.FCMacro'
+    installed = Path(App.ParamGet('User parameter:BaseApp/Preferences/Macro').GetString('MacroPath', App.getUserMacroDir(True))) / 'FreeCAD_Lay_Flat_for_CNC.FCMacro'
     for path in [local, installed]:
         if path.is_file():return path
-    raise RuntimeError('Mestra_Flat_Export.FCMacro is missing. Run Install_Mestra_Lay_Flat.FCMacro from the extracted download.')
+    raise RuntimeError('FreeCAD_Lay_Flat_for_CNC.FCMacro is missing. Run Install_FreeCAD_Lay_Flat_for_CNC.FCMacro from the extracted download.')
 
 
 def build_dialog(doc, candidates, skipped, parent):
@@ -111,7 +111,7 @@ def run():
     try:
         doc = App.ActiveDocument
         if doc is None:raise ValueError('Open a model and select parts, shelves or cabinets first.')
-        api = runpy.run_path(str(exporter_path()), run_name='mestra_panel_tag_library')
+        api = runpy.run_path(str(exporter_path()), run_name='lay_flat_panel_tag_library')
         candidates, skipped = api['panel_tag_candidates'](doc, Gui.Selection.getSelectionEx())
         dialog = build_dialog(doc, candidates, skipped, parent)
         if dialog.exec() != QtWidgets.QDialog.Accepted:return

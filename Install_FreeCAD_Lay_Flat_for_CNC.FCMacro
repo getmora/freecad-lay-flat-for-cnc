@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Install the portable Mestra Lay Flat and Panel Tags macros into this FreeCAD profile."""
+"""Install the portable FreeCAD Lay Flat for CNC and Panel Tags macros into this FreeCAD profile."""
 from pathlib import Path
 from datetime import datetime, timezone
 import os
@@ -9,11 +9,13 @@ import FreeCAD as App
 import FreeCADGui as Gui
 from PySide import QtWidgets
 
-FILES = ('Mestra_Flat_Export.FCMacro', 'Mestra_Panel_Tags.FCMacro',
-         'mestra-lay-flat.svg', 'mestra-panel-tags.svg')
+FILES = ('FreeCAD_Lay_Flat_for_CNC.FCMacro', 'Panel_Tags.FCMacro',
+         'lay-flat-for-cnc.svg', 'panel-tags.svg')
+LEGACY_MACROS = {'FreeCAD_Lay_Flat_for_CNC.FCMacro': 'Mestra_Flat_Export.FCMacro',
+                 'Panel_Tags.FCMacro': 'Mestra_Panel_Tags.FCMacro'}
 COMMANDS = (
-    ('Mestra_Flat_Export.FCMacro', 'Lay Flat', 'Choose parts and export flat sheet layouts', 'mestra-lay-flat.svg'),
-    ('Mestra_Panel_Tags.FCMacro', 'Panel Tags', 'Tag selected components as panels, or remove their tags', 'mestra-panel-tags.svg'),
+    ('FreeCAD_Lay_Flat_for_CNC.FCMacro', 'Lay Flat for CNC', 'FreeCAD Lay Flat for CNC: choose parts and export flat sheet layouts', 'lay-flat-for-cnc.svg'),
+    ('Panel_Tags.FCMacro', 'Panel Tags', 'Tag selected components as panels, or remove their tags', 'panel-tags.svg'),
 )
 
 
@@ -22,7 +24,7 @@ def find_package():
     if filename:
         folder = Path(filename).resolve().parent
         if all((folder / name).is_file() for name in FILES):return folder
-    chosen = QtWidgets.QFileDialog.getExistingDirectory(Gui.getMainWindow(), 'Choose the extracted Mestra Lay Flat download')
+    chosen = QtWidgets.QFileDialog.getExistingDirectory(Gui.getMainWindow(), 'Choose the extracted FreeCAD Lay Flat for CNC download')
     if not chosen:return None
     folder = Path(chosen)
     if not all((folder / name).is_file() for name in FILES):
@@ -48,7 +50,7 @@ def install(folder):
     macros = App.ParamGet('User parameter:BaseApp/Macro/Macros')
     toolbars = App.ParamGet('User parameter:BaseApp/Workbench/Global/Toolbar')
     toolbar_group = next((name for name in toolbars.GetGroups()
-                          if toolbars.GetGroup(name).GetString('Name') == 'Mestra'), None)
+                          if toolbars.GetGroup(name).GetString('Name') == 'FreeCAD Lay Flat for CNC'), None)
     created_toolbar = toolbar_group is None
     if toolbar_group is None:
         index = 1
@@ -63,7 +65,7 @@ def install(folder):
             old_files[name] = target.read_bytes() if target.exists() else None
             if target.exists():
                 if backup is None:
-                    backup = destination / 'Mestra-Lay-Flat-backups' / datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S-%f')
+                    backup = destination / 'FreeCAD-Lay-Flat-for-CNC-backups' / datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S-%f')
                     backup.mkdir(parents=True)
                 shutil.copy2(target, backup / name)
             fd, temporary = tempfile.mkstemp(prefix='.' + name, suffix='.installing', dir=str(destination))
@@ -74,13 +76,20 @@ def install(folder):
                 if os.path.exists(temporary):os.unlink(temporary)
             copied.append(name)
         toolbar = toolbars.GetGroup(toolbar_group)
-        toolbar.SetString('Name', 'Mestra');toolbar.SetBool('Active', True)
+        toolbar.SetString('Name', 'FreeCAD Lay Flat for CNC');toolbar.SetBool('Active', True)
         for filename, label, tooltip, icon in COMMANDS:
             command = Gui.Command.findCustomCommand(filename)
+            old_command = Gui.Command.findCustomCommand(LEGACY_MACROS.get(filename, filename))
             if command is None:
                 command = Gui.Command.createCustomCommand(filename, menuText=label, toolTip=tooltip,
                     whatsThis=tooltip, statusTip=tooltip, pixmap=str(destination / icon))
                 created_commands.append(command)
+            # Move this bundle's buttons out of the old shared toolbar while
+            # leaving Assembly Builder and unrelated commands untouched.
+            for group_name in toolbars.GetGroups():
+                group = toolbars.GetGroup(group_name)
+                if group_name != toolbar_group and group.GetString('Name') == 'Mestra':
+                    for obsolete in set(filter(None, (old_command, command))):group.RemString(obsolete)
             info = Gui.Command.get(command).getInfo()
             params = macros.GetGroup(command)
             for key, value in {'Script': filename, 'Menu': info['menuText'], 'Tooltip': info['toolTip'],
@@ -126,12 +135,12 @@ def run():
         folder = find_package()
         if folder is None:return
         result = install(folder)
-        text = 'Installed Lay Flat and Panel Tags in the Mestra toolbar.\n\n' + result['folder']
+        text = 'Installed Lay Flat for CNC and Panel Tags in the FreeCAD Lay Flat for CNC toolbar.\n\n' + result['folder']
         if result['backup']:text += '\n\nPrevious files were backed up to:\n' + result['backup']
         if result['toolbar_note']:text += '\n\n' + result['toolbar_note']
-        QtWidgets.QMessageBox.information(Gui.getMainWindow(), 'Mestra Lay Flat installed', text)
+        QtWidgets.QMessageBox.information(Gui.getMainWindow(), 'FreeCAD Lay Flat for CNC installed', text)
     except Exception as error:
-        App.Console.PrintError('Mestra Lay Flat installation failed: %s\n' % error)
+        App.Console.PrintError('FreeCAD Lay Flat for CNC installation failed: %s\n' % error)
         QtWidgets.QMessageBox.critical(Gui.getMainWindow(), 'Installation failed', str(error))
 
 

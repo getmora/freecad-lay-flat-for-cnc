@@ -1,14 +1,14 @@
-# Mestra Lay Flat 0.12.1
+# FreeCAD Lay Flat for CNC 0.12.2
 
-A portable FreeCAD macro bundle for tagging panels, choosing parts manually, and exporting flat sheet layouts. It works from solid CAD geometry, including imported STEP parts. No Mestra cabinet template or customer model is included or required.
+A portable FreeCAD macro bundle for tagging panels, choosing parts manually, and exporting flat sheet layouts. It works from solid CAD geometry, including imported STEP parts. No cabinet template or customer model is included or required.
 
-**[Download the complete ZIP](https://github.com/getmora/mestra-lay-flat/releases/download/v0.12.1/Mestra-Lay-Flat-0.12.1.zip)** · [Release notes](https://github.com/getmora/mestra-lay-flat/releases/tag/v0.12.1)
+**[Download the complete ZIP](https://github.com/getmora/freecad-lay-flat-for-cnc/releases/download/v0.12.2/FreeCAD-Lay-Flat-for-CNC-0.12.2.zip)** · [Release notes](https://github.com/getmora/freecad-lay-flat-for-cnc/releases/tag/v0.12.2)
 
 ## Install
 
 1. Extract the entire ZIP into a folder. Keep the macros and SVG icons together.
-2. In FreeCAD, use **File → Open** to open `Install_Mestra_Lay_Flat.FCMacro`, then choose **Macro → Execute Macro** with that editor active. If asked, select the extracted folder.
-3. Use **Panel Tags** and **Lay Flat** in the **Mestra** toolbar. If the toolbar cannot refresh during an active edit, finish that edit and switch workbenches, or restart FreeCAD.
+2. In FreeCAD, use **File → Open** to open `Install_FreeCAD_Lay_Flat_for_CNC.FCMacro`, then choose **Macro → Execute Macro** with that editor active. If asked, select the extracted folder.
+3. Use **Panel Tags** and **Lay Flat for CNC** in the **FreeCAD Lay Flat for CNC** toolbar. If the toolbar cannot refresh during an active edit, finish that edit and switch workbenches, or restart FreeCAD.
 
 The installer uses the configured FreeCAD macro folder. It preserves existing toolbar buttons, backs up older files before replacing them, and avoids duplicate commands when run again. No Python packages need to be installed separately.
 
@@ -16,19 +16,19 @@ Tested on **FreeCAD 1.1.3 on macOS**. Paths are portable and use FreeCAD's setti
 
 ### Manual installation
 
-Copy `Mestra_Flat_Export.FCMacro`, `Mestra_Panel_Tags.FCMacro`, and both SVG icons into the macro folder shown in **Macro → Macros**. Run either macro from that dialog. The installer is only needed to add the toolbar buttons automatically.
+Copy `FreeCAD_Lay_Flat_for_CNC.FCMacro`, `Panel_Tags.FCMacro`, and both SVG icons into the macro folder shown in **Macro → Macros**. Run either macro from that dialog. The installer is only needed to add the toolbar buttons automatically.
 
 ## Tag once, choose each time
 
 1. Select parts, complete shelves, cabinets or assemblies in the tree or 3D view. Click **Panel Tags** to expand the selection into individual components. Check the panels, leave fittings unchecked, and click **Save panel tags**. Uncheck an existing panel tag to remove it. Search plus **Check shown / Uncheck shown** makes batch tagging easier.
 2. Save your model as a FreeCAD `.FCStd` file to retain the tags. STEP files do not store these FreeCAD properties. Tags add metadata only; they do not alter geometry. Tag changes can be undone.
-3. Select an assembly/subassembly to limit the scope, or clear the selection to use the visible model. Click **Lay Flat**, review the checkboxes, and continue to sheet settings and export.
+3. Select an assembly/subassembly to limit the scope, or clear the selection to use the visible model. Click **Lay Flat for CNC**, review the checkboxes, and continue to sheet settings and export.
 
 Tagged panels start checked. Individually selected solid parts also start checked even when untagged. Other solid parts remain available to select manually. **Select tagged panels**, **Select shown**, **Clear all**, and search help manage the list. Selecting a row highlights its source component in FreeCAD.
 
 Names, file origin and thickness never automatically exclude a solid part. A part named “drawer side” remains available, as does a STEP-imported panel. Unticking a part for one export does not remove its saved tag. A search filter does not uncheck hidden rows; the selection count reports selected rows hidden by the search.
 
-The saved Boolean property is **LayFlatPanel**, under **Lay Flat** in the Data properties. A tag on a local component overrides a tag on its linked source, including an explicit False value. Source tags can be inherited by links. A component reused in multiple assembly placements shares its tag; the export picker still lists each placement separately. A multi-solid component's tag applies to all of its solids. Use separate component objects if you need separate saved tags.
+The saved Boolean property is **LayFlatPanel**, under **Lay Flat for CNC** in the Data properties. A tag on a local component overrides a tag on its linked source, including an explicit False value. Source tags can be inherited by links. A component reused in multiple assembly placements shares its tag; the export picker still lists each placement separately. A multi-solid component's tag applies to all of its solids. Use separate component objects if you need separate saved tags.
 
 Selecting a complete unit does not automatically mark all its contents as panels. Existing child tags start checked; untagged children, including hardware, start unchecked. Individually selected parts can start checked because that selection is explicit. Shared component definitions are shown once with their solid/placement count, and the whole tag update is one undoable action.
 
@@ -59,10 +59,11 @@ The chosen upper face is used for the sheet DXF. Underside operations remain doc
 
 ## Files
 
-- `Install_Mestra_Lay_Flat.FCMacro` — portable installer and toolbar setup.
-- `Mestra_Panel_Tags.FCMacro` — tag/remove-tag command.
-- `Mestra_Flat_Export.FCMacro` — manual selection, geometry analysis and export.
-- `mestra-panel-tags.svg`, `mestra-lay-flat.svg` — toolbar icons.
+
+- `Install_FreeCAD_Lay_Flat_for_CNC.FCMacro` — portable installer and toolbar setup.
+- `Panel_Tags.FCMacro` — tag/remove-tag command.
+- `FreeCAD_Lay_Flat_for_CNC.FCMacro` — manual selection, geometry analysis and export.
+- `panel-tags.svg`, `lay-flat-for-cnc.svg` — toolbar icons.
 - `SHA256SUMS.txt` — checksums for the release files.
 
 Distribute the complete ZIP so the tagging command can find the matching exporter. The Assembly Builder and your cabinet master files are separate and are not included.
