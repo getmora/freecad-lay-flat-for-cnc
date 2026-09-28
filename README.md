@@ -6,13 +6,14 @@ For example, open a cabinet model, choose its sides and shelves, and arrange fla
 
 **Your original model stays in place.** The tool exports separate copies; you do not need to dismantle or flatten your assembly by hand.
 
-**[Download version 0.12.2 — complete ZIP](https://github.com/getmora/freecad-lay-flat-for-cnc/releases/download/v0.12.2/FreeCAD-Lay-Flat-for-CNC-0.12.2.zip)** · [Release notes](https://github.com/getmora/freecad-lay-flat-for-cnc/releases/tag/v0.12.2)
+**[Download version 0.12.4 — complete ZIP](https://github.com/getmora/freecad-lay-flat-for-cnc/releases/download/v0.12.4/FreeCAD-Lay-Flat-for-CNC-0.12.4.zip)** · [Release notes](https://github.com/getmora/freecad-lay-flat-for-cnc/releases/tag/v0.12.4)
 
 ## What it does
 
 - Lets you choose exactly which solid parts to export, including parts imported from STEP files.
 - Lays the parts flat and arranges them on sheets, with settings for sheet size, spacing, quantities, rotation and grain direction.
-- Exports sheet DXF drawings, individual part drawings, exact 3D copies and part lists.
+- Exports sheet DXF drawings, individual part drawings, 3D manufacturing copies and part lists.
+- Lets you remove small finishing fillets from export copies, with an adjustable radius and support for mirrored parts.
 - Optionally remembers which components are panels, so they start checked next time.
 
 **This prepares geometry for CAM; it does not generate G-code.** You still set up cutters, cutting depths, toolpaths and machine settings in your CAM software.
@@ -31,7 +32,7 @@ The tool runs as FreeCAD macros: small scripts opened inside FreeCAD. You do not
 2. **Run the installer inside FreeCAD.** Choose **File → Open** and open `Install_FreeCAD_Lay_Flat_for_CNC.FCMacro` from the extracted folder. With that file's editor tab active, choose **Macro → Execute Macro**. If a folder chooser appears, select the extracted folder.
 3. **Look for the “FreeCAD Lay Flat for CNC” toolbar.** It contains **Panel Tags** and **Lay Flat for CNC**. If it does not appear, finish any active edit and switch workbenches, or restart FreeCAD.
 
-To update an existing installation, repeat these steps with the new ZIP. The installer backs up older files before replacing them and preserves other toolbar buttons.
+To update an existing installation, repeat these steps with the new ZIP. The installer backs up older files before replacing them and preserves other toolbar buttons. Close any open Lay Flat dialog, then launch **Lay Flat for CNC** again to use the updated macro.
 
 <details>
 <summary>Manual installation — if the toolbar installer does not work</summary>
@@ -54,9 +55,23 @@ Open your model in FreeCAD, then decide what to include:
 - **A cabinet or subassembly:** select it to review the parts inside it.
 - **The visible model:** clear your selection before starting.
 
-Click **Lay Flat for CNC**. In **Choose parts to lay flat**, check the panels you want and leave hinges, screws and other fittings unchecked. Click a row to highlight the original component in FreeCAD. Click **Continue** when the selection is right.
+Click **Lay Flat for CNC**. In **Choose parts to lay flat**, check the panels you want and leave hinges, screws and other fittings unchecked. Click a row to highlight the original component in FreeCAD.
 
 Individually selected solid parts and previously tagged panels start checked. Selecting a whole cabinet does **not** automatically check all its contents. You can check other solid parts manually, regardless of their name or thickness.
+
+Before clicking **Continue**, check **Remove fillets up to** below the part list. This controls whether small rounded edges are removed from the manufacturing copies:
+
+- **1 mm (default):** remove supported fillets of 1 mm or less, including exactly 1 mm. Larger fillets remain.
+- **Another radius:** include fillets up to and including that radius.
+- **0 — Off:** keep all fillets. Use this when you want the export geometry to match the original model.
+
+The control starts at **1 mm each time you open the part picker**. It applies to this export only and does not change the source model or saved panel tags. Removed fillets are omitted from **all export copies**, including DXFs, STEP files, `Flat_parts.FCStd` and the sheet preview. Existing exports are not changed; run a new export to apply the setting.
+
+Fillet removal follows native **PartDesign Fillet** features in the model's history. Small holes, slots and other curves are not selected just because of their radius. Mirrored copies of whole parts are supported when their references lead back to that history. Holes and pockets added after a fillet must survive the geometry checks.
+
+**Imported STEP parts and other solids without native fillet history keep their fillets.** The sheet-settings window reports how many parts had fillets removed and how many lacked that history. Detailed results are saved in each part's `fillet_removal` entry in `manifest.json`.
+
+If a selected fillet cannot be removed safely, the export stops and names the part. Adjust the cutoff, correct the model, or leave that part out. Setting the cutoff to 0 keeps the original fillets, but does not bypass the exporter's normal geometry checks.
 
 ### 2. Set up the sheets
 
@@ -93,12 +108,12 @@ Click **Export sheet DXFs…**. When the export finishes, click **Open export fo
 | --- | --- |
 | `Sheet_*.dxf` | The arranged sheet drawings, showing the upper machining face. |
 | Individual part `.dxf` files | Drawings of each exported part on its own. |
-| Individual part `.step` files | Exact 3D solids, including features on both sides. |
+| Individual part `.step` files | 3D export solids, including features on both sides and the chosen fillet-removal setting. |
 | `Flat_parts.FCStd` | A FreeCAD document containing the flattened 3D parts. |
 | `Sheet_layout.FCStd` | An optional FreeCAD sheet-layout preview. |
 | `parts.csv` and `quantities.csv` | Part dimensions, sheet placements and quantities; open these in a spreadsheet. |
 | `SHEET_NOTES.txt` | Machining notes and explanations of reference layers. |
-| `manifest.json` | Detailed export records, including operation depths and underside features. |
+| `manifest.json` | Detailed export records, including operation depths, underside features and fillet-removal results. |
 
 ## Optional: remember which parts are panels
 
@@ -117,6 +132,7 @@ In either selection dialog, searching only hides rows: **checked rows remain che
 - **Only the chosen upper face is drawn for machining.** Underside operations are recorded in the notes and `manifest.json`, and remain in the exact 3D files. No separate underside sheet layout is generated. Plan the second setup in CAM if your part needs one.
 - **Sheet layout uses rectangular packing.** It leaves room around each part's machining boundaries. It does not nest irregular shapes together or guarantee the best material yield.
 - **Drawings are not finished toolpaths.** Reference layers and labels are not cuts. Taper and roundover guides still need cutter and toolpath setup in CAM.
+- **Fillet removal needs identifiable model history.** It supports native PartDesign fillets and verified whole-part references and Part mirrors. Imported solids, partial references and other modelling patterns are not automatically simplified. A copy with additional unaccounted geometry changes is rejected rather than losing those changes.
 - **Geometry support has limits.** Parts need valid solids with a broad flat face. Supported features include flat-bottomed recesses, perpendicular holes and drill tips, supported tapers and convex edge roundovers, with straight or circular-arc boundaries. Sideways or angled drilling, freeform boundaries and ambiguous thickness can stop an export.
 
 ## Troubleshooting
@@ -126,6 +142,9 @@ In either selection dialog, searching only hides rows: **checked rows remain che
 | The installer says the folder is incomplete | Extract the complete ZIP and select the folder containing all three macros and both icons. |
 | The toolbar does not appear | Finish any active edit, then switch workbenches or restart FreeCAD. If installation failed, try the manual steps above. |
 | The parts I expected are not checked | Check them manually. Tags and individually selected parts start checked; untagged children of a selected assembly do not. |
+| Rounded corners remain in the export | Check **Remove fillets up to** in the part picker. The radius is inclusive; larger fillets remain. Imported solids without native fillet history are not simplified. Generate a new export after changing the setting. |
+| I want to keep the model's fillets | Set **Remove fillets up to** to **0 — Off** before continuing. It defaults to 1 mm when the part picker opens again. |
+| Fillet removal fails on a part | Read the named part and reason. Reduce the cutoff or set it to 0 to retain its fillets, correct the model, or uncheck the part. Keeping fillets does not make otherwise unsupported geometry exportable. |
 | A selected part stops the export | Read the named part and reason in the error message. Correct it, or run the tool again and uncheck that part to export the others. |
 | Thickness cannot be detected reliably | Try selecting a broad flat face on the part before running the tool. This can guide flattening. |
 | A part will not fit, or grain does not line up | Check its rotation, sheet dimensions, margins, gap and grain settings, then update the preview. |

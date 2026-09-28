@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""FreeCAD Lay Flat for CNC 0.12.2 -- self-contained FreeCAD macro, millimetres.
+"""FreeCAD Lay Flat for CNC 0.12.4 -- self-contained FreeCAD macro, millimetres.
 
 Run in FreeCAD. Select finished Bodies/parts (optional); otherwise the dialog
 lists Bodies. Each solid is one part. Source objects are never changed.
@@ -7,7 +7,8 @@ Manual solid-part selection. Panel tags are defaults, never exclusion rules.
 Thickness is measured from selected geometry; there is no stock-thickness whitelist.
 Supported: planar pockets, perpendicular holes/drill tips, ruled tapered cuts,
 and convex edge roundovers. Tapers carry explicit angle/depth contours; rounded
-finishing is marked as reference regions. Exact solids accompany every export.
+finishing is marked as reference regions. Export solids accompany every export.
+Optional native fillet removal affects export copies only, with a selectable radius.
 Prismatic/taper geometry is reconstructed; residual removal must stay inside
 identified roundover envelopes. Rebate extensions cannot remove final material.
 Fixed rotations/grain controls and stock sheets are set in the export dialog.
@@ -25,7 +26,7 @@ from pathlib import Path
 import FreeCAD as App
 import Part
 
-VERSION = '0.12.2'
+VERSION = '0.12.4'
 PANEL_TAG = 'LayFlatPanel'
 STOCK_THICKNESS_TOL = 0.05
 TOL = 1e-5
@@ -1291,7 +1292,8 @@ def output_parts(parts, parent, title='FreeCAD_Lay_Flat_for_CNC', create_preview
             record['source_instance'] = part.get('source_instance', '')
             record['source_document'] = part.get('source_document', '')
             record['source_object'] = part.get('source_object', '')
-            record['verification_scope'] = 'Prismatic and ruled-taper operations are reconstructed; remaining finishing removal is confined to identified convex roundover envelopes. The STEP and flat FCStd files retain the exact final geometry. Rebate extensions are separately checked against the final solid.'
+            record['fillet_removal'] = part.get('fillet_removal', {'status': 'disabled', 'maximum_radius_mm': 0})
+            record['verification_scope'] = 'Prismatic and ruled-taper operations are reconstructed; remaining finishing removal is confined to identified convex roundover envelopes. STEP and flat FCStd files retain the export geometry, including any explicitly requested fillet removal recorded here. Rebate extensions are separately checked against that solid.'
             record['operations'] = [{**{k: v for k, v in op.items() if k != 'face'}, 'side': 'UP'} for op in part['operations']]
             record['face_selection']=part['face_selection']
             record['underside_feature_count']=part['underside_feature_count']
@@ -1362,7 +1364,9 @@ def output_parts(parts, parent, title='FreeCAD_Lay_Flat_for_CNC', create_preview
             'All depths are measured from the original board face. TIP distinguishes drill-tip depth from full-diameter depth.\n'
             'Operation layer names and colours are user-editable; original identifiers and exact depths remain in manifest.json.\n'
             'DXF R2004 stores chosen RGB colours with an indexed colour fallback.\n'
-            'Flat_parts.FCStd and individual STEP files preserve every final 3D feature.\n'
+            'Flat_parts.FCStd and individual STEP files use the export geometry, including requested fillet removal. The source model is unchanged.\n'
+            'Fillet removal includes the selected radius. It uses native PartDesign fillet history, never the radius of arbitrary arcs or holes. See each part\'s fillet_removal record in manifest.json.\n'
+            'STEP/imported solids without native fillet history keep their fillets. A cutoff of 0 disables removal.\n'
             'TAPER layers give wide and narrow contours with angle and start/end depths from the named board face. These are geometry for CAM setup, not cutter-compensated toolpaths.\n'
             'REFERENCE_TAPER and REFERENCE_EDGE_ROUND layers are guides, not through cuts. Rounded finishing regions are envelopes; use the exact STEP surface for cutter setup.\n'
             'Parts were manually selected. Panel tags are selection defaults; names, STEP origin and thickness never exclude solid parts. Thickness is measured from geometry.\n', encoding='utf-8')
@@ -1810,6 +1814,181 @@ def display_part_label(label):
     return ' / '.join([x for x in labels[:-1] if 'bay ' in x.lower() or 'complete drawer' in x.lower()]+[labels[-1]])
 
 
+def transfer_fillet_copy(original, prepared, target, label):
+    """Transfer only a proven complete rigid copy, never discard later edits."""
+    if any(shape.isNull() or not shape.isValid() or len(shape.Solids) != 1
+           for shape in (original, prepared, target)):
+        raise ExportError('Cannot follow fillet history through %s: a complete single-solid copy is required.' % label)
+    tolerance = max(1e-4, target.Volume * 1e-9)
+    matches = []
+    # Binders may bake the source placement into their geometry or retain it
+    # as a TopoShape location. Prove either representation against the target.
+    for transform in (App.Placement(), target.Placement.multiply(original.Placement.inverse())):
+        expected = original.copy()
+        expected.Placement = transform.multiply(expected.Placement)
+        if expected.cut(target).Volume + target.cut(expected).Volume <= tolerance:
+            result = prepared.copy()
+            result.Placement = transform.multiply(result.Placement)
+            matches.append(result)
+    if not matches:
+        raise ExportError('Cannot follow fillet history through %s: the copy has additional geometry changes. '
+                          'Set the cutoff to 0 to keep its geometry.' % label)
+    if len(matches) > 1 and matches[0].cut(matches[1]).Volume + matches[1].cut(matches[0]).Volume > tolerance:
+        raise ExportError('The placement of inherited fillets is ambiguous in ' + label)
+    return matches[0]
+
+
+def inherited_fillet_copy(obj, maximum_radius, ancestors):
+    """Resolve whole-shape references/mirrors without changing any document."""
+    upstream = None
+    if obj.TypeId == 'PartDesign::SubShapeBinder':
+        support = list(obj.Support)
+        if len(support) == 1 and not any(support[0][1]):
+            upstream = linked_target(support[0][0])
+    elif obj.TypeId == 'Part::Mirroring':
+        upstream = obj.Source
+    elif (obj.TypeId == 'PartDesign::Body' and obj.Tip is not None
+          and obj.Tip.TypeId == 'PartDesign::FeatureBase'):
+        upstream = obj.BaseFeature
+    if upstream is None:
+        return None
+    prepared, report = remove_small_fillets(upstream, maximum_radius, ancestors)
+    if report['status'] != 'removed':
+        return obj.Shape.copy(), report
+    original = upstream.Shape.copy()
+    if obj.TypeId == 'Part::Mirroring':
+        # Shape.mirror returns a new shape; it does not mutate its input.
+        original = original.mirror(obj.Base, obj.Normal)
+        prepared = prepared.mirror(obj.Base, obj.Normal)
+    result = transfer_fillet_copy(original, prepared, obj.Shape, obj.Label)
+    report = dict(report, inherited_via=list(report.get('inherited_via', [])) +
+                  [{'document': obj.Document.Name, 'object': obj.Name, 'type': obj.TypeId}])
+    return result, report
+
+
+def remove_small_fillets(body, maximum_radius, ancestors=()):
+    """Defeature a copy using native fillet history, never arc size alone."""
+    maximum_radius = float(maximum_radius)
+    if not math.isfinite(maximum_radius) or maximum_radius < 0:
+        raise ExportError('The fillet cutoff must be a finite, non-negative radius.')
+    original = body.Shape.copy()
+    report = {'maximum_radius_mm': maximum_radius, 'inclusive': True,
+              'removed_features': [], 'removed_faces': 0, 'added_volume_mm3': 0.0}
+    if maximum_radius == 0:
+        report['status'] = 'disabled'
+        return original, report
+    identity = object_id(body)
+    if identity in ancestors or len(ancestors) >= 64:
+        raise ExportError('Circular or excessively nested fillet source history in ' + body.Label)
+    inherited = inherited_fillet_copy(body, maximum_radius, ancestors + (identity,))
+    if inherited is not None:
+        return inherited
+    if body.TypeId != 'PartDesign::Body':
+        report['status'] = 'no_native_fillet_history'
+        return original, report
+    features, seen = [], set()
+    feature = body.Tip
+    while feature is not None:
+        if object_id(feature) in seen:
+            raise ExportError('Circular feature history in ' + body.Label)
+        seen.add(object_id(feature))
+        if (feature.TypeId == 'PartDesign::Fillet' and not getattr(feature, 'Suppressed', False)
+                and 0 < float(feature.Radius) <= maximum_radius + 1e-9):
+            features.append(feature)
+        feature = getattr(feature, 'BaseFeature', None)
+    if not features:
+        report['status'] = 'no_qualifying_fillets'
+        return original, report
+    if len(original.Solids) != 1 or not original.isValid():
+        raise ExportError('Fillet removal requires a valid, single-solid Body. Set the cutoff to 0 to keep its fillets.')
+
+    generated, envelopes = [], []
+    for feature in features:
+        base = feature.Base[0]
+        if base is None:
+            raise ExportError('Cannot read the base of fillet ' + feature.Label)
+        before, after = base.Shape.copy(), feature.Shape.copy()
+        # Body geometry includes its placement; its feature history is local.
+        for shape in (before, after):
+            shape.Placement = body.Placement.multiply(shape.Placement)
+        boundary = Part.makeCompound(before.Faces)
+        new_faces = []
+        for face in after.Faces:
+            if isinstance(face.Surface, Part.Plane):
+                continue
+            tolerance = max(TOL, face.Area * 1e-8)
+            shared = face.common(boundary).Area
+            if shared < tolerance:
+                new_faces.append(face)
+            elif face.Area - shared > tolerance:
+                raise ExportError('Cannot isolate the faces created by fillet %s. Set the cutoff to 0 to keep it.' % feature.Label)
+        if not new_faces:
+            raise ExportError('No removable faces could be identified for fillet ' + feature.Label)
+        generated.extend(new_faces)
+        envelopes.append(before.cut(after))
+
+    fillet_boundary = Part.makeCompound(generated)
+    selected, retained = [], []
+    for face in original.Faces:
+        if isinstance(face.Surface, Part.Plane):
+            retained.append(face)
+            continue
+        tolerance = max(TOL, face.Area * 1e-8)
+        shared = face.common(fillet_boundary).Area
+        if shared < tolerance:
+            retained.append(face)
+        elif abs(face.Area - shared) <= tolerance:
+            selected.append(face)
+        else:
+            raise ExportError('A later feature overlaps a fillet ambiguously. Set the cutoff to 0 or adjust the source fillet.')
+    if not selected:
+        report['status'] = 'qualifying_fillets_no_longer_exposed'
+        return original, report
+    try:
+        result = original.defeaturing(selected)
+        if result.isNull() or not result.isValid() or len(result.Solids) != 1:
+            raise ExportError('Removing the selected fillets did not produce one valid solid.')
+        volume_tolerance = max(1e-4, original.Volume * 1e-9)
+        added = result.cut(original)
+        allowed = envelopes[0].multiFuse(envelopes[1:]) if len(envelopes) > 1 else envelopes[0]
+        if original.cut(result).Volume > volume_tolerance or added.cut(allowed).Volume > volume_tolerance:
+            raise ExportError('Fillet removal changed material outside the selected fillets.')
+        boundary = Part.makeCompound(result.Faces)
+        for face in retained:
+            if abs(face.Area - face.common(boundary).Area) > max(TOL, face.Area * 1e-8):
+                raise ExportError('Fillet removal changed another face, hole or pocket.')
+        if any(face.common(boundary).Area > max(TOL, face.Area * 1e-8) for face in selected):
+            raise ExportError('FreeCAD could not remove all the selected fillet faces.')
+        report.update(status='removed', removed_faces=len(selected), added_volume_mm3=added.Volume,
+                      removed_features=[{'name': f.Name, 'radius_mm': float(f.Radius),
+                                         'document': body.Document.Name, 'body': body.Name} for f in features],
+                      validation='No source material removed; added material confined to selected fillets; all other source faces preserved.')
+        return result, report
+    except Exception as exc:
+        raise ExportError('Could not safely remove fillets up to %s mm: %s Set the cutoff to 0 to keep the original geometry.'
+                          % (mm(maximum_radius), exc)) from exc
+
+
+def prepare_candidate(candidate, maximum_radius=0, cache=None):
+    """Keep each assembly instance's placement while sharing source processing."""
+    source = App.getDocument(candidate['source_document']).getObject(candidate['source_object'])
+    cache = {} if cache is None else cache
+    key = (object_id(source), float(maximum_radius))
+    if key not in cache:
+        cache[key] = remove_small_fillets(source, maximum_radius)
+    prepared, report = cache[key]
+    if report['status'] != 'removed':
+        return candidate['shape'], dict(report)
+    original = source.Shape.Solids[0]
+    placed = candidate['shape']
+    if not original.isPartner(placed):
+        raise ExportError('Cannot transfer fillet removal to this assembly instance. Scaled or altered links require a separate manufacturing Body.')
+    transform = placed.Placement.multiply(original.Placement.inverse())
+    result = prepared.copy()
+    result.Placement = transform.multiply(result.Placement)
+    return result, dict(report)
+
+
 def build_part_picker(candidates, skipped, QtWidgets, QtCore, parent):
     dialog = QtWidgets.QDialog(parent)
     dialog.setWindowTitle('Choose parts to lay flat')
@@ -1883,6 +2062,17 @@ def build_part_picker(candidates, skipped, QtWidgets, QtCore, parent):
         note = QtWidgets.QLabel('%d non-solid items could not be listed. Hover here for details.' % len(skipped))
         note.setToolTip('\n'.join('%s: %s' % (item['label'], item['reason']) for item in skipped))
         note.setWordWrap(True);layout.addWidget(note)
+    fillet_row = QtWidgets.QHBoxLayout()
+    fillet_row.addWidget(QtWidgets.QLabel('Remove fillets up to'))
+    fillet_radius = QtWidgets.QDoubleSpinBox()
+    fillet_radius.setObjectName('FreeCADLayFlatFilletRadius')
+    fillet_radius.setDecimals(3);fillet_radius.setRange(0, 1000);fillet_radius.setSingleStep(0.1)
+    fillet_radius.setSuffix(' mm');fillet_radius.setSpecialValueText('Off — keep all fillets')
+    fillet_radius.setValue(1.0)
+    fillet_radius.setToolTip('Includes the selected radius. 0 keeps all fillets. Only native PartDesign fillet features are removed; holes and other small curves are preserved.')
+    fillet_row.addWidget(fillet_radius);fillet_row.addStretch();layout.addLayout(fillet_row)
+    fillet_note = QtWidgets.QLabel('Applies to export copies only, including DXF and 3D files. STEP/imported solids without native fillet history keep their fillets.')
+    fillet_note.setWordWrap(True);layout.addWidget(fillet_note)
     note = QtWidgets.QLabel('Next: selected parts are checked, thicknesses are measured, and sheet settings are shown. '
                             'This selection does not change saved panel tags.')
     note.setWordWrap(True);layout.addWidget(note)
@@ -1900,13 +2090,14 @@ def build_part_picker(candidates, skipped, QtWidgets, QtCore, parent):
     dialog.select_tagged_button = tagged_button
     dialog.select_shown_button = shown_button
     dialog.clear_button = clear_button
+    dialog.fillet_radius = fillet_radius
     return dialog
 
 
 def choose_plywood_parts(candidates, skipped, QtWidgets, QtCore, parent):
     dialog = build_part_picker(candidates, skipped, QtWidgets, QtCore, parent)
     if dialog.exec() != QtWidgets.QDialog.Accepted:return None
-    return dialog.selected_candidates()
+    return [dict(candidate, fillet_radius_mm=dialog.fillet_radius.value()) for candidate in dialog.selected_candidates()]
 
 
 def save_flat_solids(sheets, path):
@@ -1959,6 +2150,15 @@ def configure_parts(parts, QtWidgets, QtCore, QtGui, parent):
     intro = QtWidgets.QLabel('The face with most recesses is placed UP; through-openings are cut from that same side. Use Flip over to change a part. One layout is exported per sheet.\nSet each panel’s total quantity and rotation, then preview the sheets. Each assembly instance is counted once before quantities are applied.\nA separate sheet section is provided for each detected thickness. Grain is supplied by you.')
     intro.setWordWrap(True)
     outer_layout.addWidget(intro)
+    fillet_reports = [p['fillet_removal'] for p in parts if 'fillet_removal' in p]
+    if fillet_reports:
+        removed = sum(r['status'] == 'removed' for r in fillet_reports)
+        unavailable = sum(r['status'] == 'no_native_fillet_history' for r in fillet_reports)
+        cutoffs = ', '.join(mm(v) for v in sorted({r['maximum_radius_mm'] for r in fillet_reports}))
+        note = QtWidgets.QLabel('Fillet cutoff: %s mm (inclusive; 0 = off). Removed from %d part(s). '
+                                '%d part(s) have no native fillet history and keep their curves. Cancel and return to part selection to change the cutoff.'
+                                % (cutoffs, removed, unavailable))
+        note.setWordWrap(True);outer_layout.addWidget(note)
     underside=[p for p in parts if p['underside_feature_count']]
     if underside:
         note=QtWidgets.QLabel('%d selected part(s) also have underside machining. It is listed in the part notes and manifest, and retained in 3D; the UP DXFs cover the upper face only.'%len(underside))
@@ -2519,18 +2719,27 @@ def run():
         candidates = choose_plywood_parts(candidates, skipped, QtWidgets, QtCore, parent)
         if candidates is None:
             return
-        parts, failures = [], []
+        parts, failures, fillet_cache = [], [], {}
         parent.statusBar().showMessage('Reading individual panels…')
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
             for candidate in candidates:
-                shape = candidate['shape']
+                try:
+                    shape, fillet_report = prepare_candidate(candidate, candidate.get('fillet_radius_mm', 0), fillet_cache)
+                except Exception as exc:
+                    failures.append('%s: %s' % (candidate['label'], exc))
+                    continue
                 for index, solid in enumerate(shape.Solids, 1):
                     label = candidate['label']
                     if len(shape.Solids) > 1:
                         label += '_%02d' % index
                     try:
                         part = select_machining_face(analyse_solid(solid, label, candidate['normal']))
+                        part['fillet_removal'] = fillet_report
+                        if fillet_report['status'] == 'removed':
+                            part['notes'].append('Export copy: native fillets up to and including %s mm removed; source model unchanged.' % mm(fillet_report['maximum_radius_mm']))
+                        elif fillet_report['status'] == 'no_native_fillet_history':
+                            part['notes'].append('Fillet removal not applied: no native PartDesign Body history; original curves retained.')
                         part['source_object'] = candidate['source_object']
                         part['source_document'] = candidate['source_document']
                         part['source_instance'] = candidate['source_instance']
