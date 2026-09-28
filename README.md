@@ -30,7 +30,7 @@ For example, open a cabinet model, choose its sides and shelves, and arrange fla
 
 ## Screenshots
 
-See the [screenshot walkthrough](docs/UI_GUIDE.md) for panel tagging, part selection, sheet settings, the generated layout, operation groups, right-click export and every format option. All screenshots use a small example model.
+The [screenshot walkthrough](docs/UI_GUIDE.md) explains **how to open each screen, why to use it, what its buttons do and what happens next**. Start with [making the toolbar buttons available](docs/UI_GUIDE.md#start-here-make-the-two-toolbar-buttons-available). All screenshots use a small example model.
 
 ![Sheet layout with operations grouped by type, diameter and depth](docs/images/05-operation-tree.png)
 
@@ -46,9 +46,18 @@ The tool runs as FreeCAD macros: small scripts opened inside FreeCAD. You do not
 
 1. **Download and extract the complete ZIP** using the link above. Keep all the extracted files together, including the three `.FCMacro` files, two `.svg` icons and the `lay_flat_sheet.py` companion file.
 2. **Run the installer inside FreeCAD.** Choose **File → Open** and open `Install_FreeCAD_Lay_Flat_for_CNC.FCMacro` from the extracted folder. With that file's editor tab active, choose **Macro → Execute Macro**. If a folder chooser appears, select the extracted folder.
-3. **Look for the “FreeCAD Lay Flat for CNC” toolbar.** It contains **Panel Tags** and **Lay Flat for CNC**. If it does not appear, finish any active edit and switch workbenches, or restart FreeCAD.
+3. **Look for the “FreeCAD Lay Flat for CNC” toolbar.** It contains **Panel Tags** and **Lay Flat for CNC**. If hidden, tick it under **View → Toolbars**. If it is not listed, check that installation completed, finish any active edit and switch workbenches, or restart FreeCAD after saving your work.
 
 To update an existing installation, repeat these steps with the new ZIP. The installer backs up older files before replacing them and preserves other toolbar buttons. If you have already used Lay Flat in this session, save your work and restart FreeCAD after updating so the loaded companion code is refreshed.
+
+### Which button should I click?
+
+| Toolbar button | Open it this way | Why use it? |
+| --- | --- | --- |
+| <img src="panel-tags.svg" width="28" alt="Panel Tags icon"> **Panel Tags** | Select a part or whole cabinet/assembly in your original model, then click this button. | Optional: remember which components are panels. **Save panel tags** is available when there are tag changes to save. Save the `.FCStd` model afterwards. This does not create a layout or export files. |
+| <img src="lay-flat-for-cnc.svg" width="28" alt="Lay Flat for CNC icon"> **Lay Flat for CNC** | With your original model active, select parts/an assembly or clear the selection, then click this button. | Choose parts and arrange them on sheets. You can use it without Panel Tags. It opens the part picker, then sheet settings. Files are exported later from the layout's right-click menu. |
+
+The installer creates these buttons; copying macro files manually does not. Without the toolbar, choose **Macro → Macros…**, select `Panel_Tags.FCMacro` or `FreeCAD_Lay_Flat_for_CNC.FCMacro`, then click **Execute**. When running the installer through **Macro → Execute macro**, its editor tab must have focus for that command to be available.
 
 <details>
 <summary>Manual installation — if the toolbar installer does not work</summary>
