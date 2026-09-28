@@ -6,17 +6,33 @@ For example, open a cabinet model, choose its sides and shelves, and arrange fla
 
 **Your original model stays in place.** The tool exports separate copies; you do not need to dismantle or flatten your assembly by hand.
 
-**[Download version 0.12.4 — complete ZIP](https://github.com/getmora/freecad-lay-flat-for-cnc/releases/download/v0.12.4/FreeCAD-Lay-Flat-for-CNC-0.12.4.zip)** · [Release notes](https://github.com/getmora/freecad-lay-flat-for-cnc/releases/tag/v0.12.4)
+**[Download version 0.12.8 — complete ZIP](https://github.com/getmora/freecad-lay-flat-for-cnc/releases/download/v0.12.8/FreeCAD-Lay-Flat-for-CNC-0.12.8.zip)** · [Release notes](https://github.com/getmora/freecad-lay-flat-for-cnc/releases/tag/v0.12.8)
+
+## New in 0.12.8
+
+- **Create first, export later:** inspect the sheet layout, then right-click to export all sheets or just one.
+- **Clearer operation groups:** matching operations share one item per sheet, with explicit diameter/depth labels and separate non-cutting guides.
+- **More export choices:** standard DXF, 1:1 millimetre SVG, both formats, or a Mozaik-targeted R12 DXF preset. Actual Mozaik import remains unverified.
+- **Less repeated work:** unchanged previews, sheet packing and shared fillet sources reuse validated results. Geometry edits still trigger checks.
+
+**Updating from an older version:** use the complete ZIP and installer so the `lay_flat_sheet.py` companion is installed too. It enables the saved layout's right-click export menu.
 
 ## What it does
 
 - Lets you choose exactly which solid parts to export, including parts imported from STEP files.
 - Lays the parts flat and arranges them on sheets, with settings for sheet size, spacing, quantities, rotation and grain direction.
-- Exports sheet DXF drawings, individual part drawings, 3D manufacturing copies and part lists.
+- Creates a sheet layout to inspect before exporting DXF, SVG or both.
+- Can include individual part drawings, 3D manufacturing copies and part lists in a complete export package.
 - Lets you remove small finishing fillets from export copies, with an adjustable radius and support for mirrored parts.
 - Optionally remembers which components are panels, so they start checked next time.
 
 **This prepares geometry for CAM; it does not generate G-code.** You still set up cutters, cutting depths, toolpaths and machine settings in your CAM software.
+
+## Screenshots
+
+See the [screenshot walkthrough](docs/UI_GUIDE.md) for panel tagging, part selection, sheet settings, the generated layout, operation groups, right-click export and every format option. All screenshots use a small example model.
+
+![Sheet layout with operations grouped by type, diameter and depth](docs/images/05-operation-tree.png)
 
 ## Before you start
 
@@ -28,24 +44,24 @@ The tool runs as FreeCAD macros: small scripts opened inside FreeCAD. You do not
 
 ## Install
 
-1. **Download and extract the complete ZIP** using the link above. Keep all the extracted files together, including the three `.FCMacro` files and two `.svg` icons.
+1. **Download and extract the complete ZIP** using the link above. Keep all the extracted files together, including the three `.FCMacro` files, two `.svg` icons and the `lay_flat_sheet.py` companion file.
 2. **Run the installer inside FreeCAD.** Choose **File → Open** and open `Install_FreeCAD_Lay_Flat_for_CNC.FCMacro` from the extracted folder. With that file's editor tab active, choose **Macro → Execute Macro**. If a folder chooser appears, select the extracted folder.
 3. **Look for the “FreeCAD Lay Flat for CNC” toolbar.** It contains **Panel Tags** and **Lay Flat for CNC**. If it does not appear, finish any active edit and switch workbenches, or restart FreeCAD.
 
-To update an existing installation, repeat these steps with the new ZIP. The installer backs up older files before replacing them and preserves other toolbar buttons. Close any open Lay Flat dialog, then launch **Lay Flat for CNC** again to use the updated macro.
+To update an existing installation, repeat these steps with the new ZIP. The installer backs up older files before replacing them and preserves other toolbar buttons. If you have already used Lay Flat in this session, save your work and restart FreeCAD after updating so the loaded companion code is refreshed.
 
 <details>
 <summary>Manual installation — if the toolbar installer does not work</summary>
 
 1. In FreeCAD, open **Macro → Macros** and find the macro folder shown in that dialog.
-2. Copy these four files from the extracted ZIP into that folder: `FreeCAD_Lay_Flat_for_CNC.FCMacro`, `Panel_Tags.FCMacro`, `lay-flat-for-cnc.svg` and `panel-tags.svg`.
+2. Copy these five files from the extracted ZIP into that folder: `FreeCAD_Lay_Flat_for_CNC.FCMacro`, `Panel_Tags.FCMacro`, `lay_flat_sheet.py`, `lay-flat-for-cnc.svg` and `panel-tags.svg`. Keep the Python companion beside the main macro; it restores the right-click export menu when saved layouts reopen.
 3. Return to **Macro → Macros**, select `FreeCAD_Lay_Flat_for_CNC.FCMacro` or `Panel_Tags.FCMacro`, and run it. You can use both tools this way without toolbar buttons.
 
 </details>
 
-## Make your first export
+## Create a sheet layout, then export
 
-You can export straight away. **Panel tagging is optional.**
+Start with your model. **Panel tagging is optional.**
 
 ### 1. Choose your parts
 
@@ -65,17 +81,17 @@ Before clicking **Continue**, check **Remove fillets up to** below the part list
 - **Another radius:** include fillets up to and including that radius.
 - **0 — Off:** keep all fillets. Use this when you want the export geometry to match the original model.
 
-The control starts at **1 mm each time you open the part picker**. It applies to this export only and does not change the source model or saved panel tags. Removed fillets are omitted from **all export copies**, including DXFs, STEP files, `Flat_parts.FCStd` and the sheet preview. Existing exports are not changed; run a new export to apply the setting.
+The control starts at **1 mm each time you open the part picker**. It applies to this export only and does not change the source model or saved panel tags. Removed fillets are omitted from **all export copies**, including DXFs, SVGs, STEP files, `Flat_parts.FCStd` and the sheet preview. Existing exports are not changed; run a new export to apply the setting.
 
 Fillet removal follows native **PartDesign Fillet** features in the model's history. Small holes, slots and other curves are not selected just because of their radius. Mirrored copies of whole parts are supported when their references lead back to that history. Holes and pockets added after a fillet must survive the geometry checks.
 
-**Imported STEP parts and other solids without native fillet history keep their fillets.** The sheet-settings window reports how many parts had fillets removed and how many lacked that history. Detailed results are saved in each part's `fillet_removal` entry in `manifest.json`.
+**Imported STEP parts and other solids without native fillet history keep their fillets.** The sheet-settings window reports how many parts had fillets removed and how many lacked that history. Detailed results are saved in each part's `fillet_removal` entry in the complete package's `manifest.json`.
 
 If a selected fillet cannot be removed safely, the export stops and names the part. Adjust the cutoff, correct the model, or leave that part out. Setting the cutoff to 0 keeps the original fillets, but does not bypass the exporter's normal geometry checks.
 
 ### 2. Set up the sheets
 
-Use **Browse…** beside **Export folder** to choose where to save the files. The tool creates a new folder there for each export, keeping previous exports.
+At this stage you are arranging the parts, not exporting files. You choose an export folder later from the sheet layout’s right-click menu.
 
 Review the part settings:
 
@@ -92,28 +108,68 @@ Leave **Extend open rebates past edges** at **0 mm** unless you need that featur
 
 Different thicknesses use separate sheets. Parts of the **same thickness are treated as the same material**, so export different materials separately. The tool measures thickness from the model; it never resizes a part to match your stock.
 
-### 3. Preview and export
+### 3. Create the sheet layout
 
 Review the sheet preview. It updates automatically unless you turn that option off; you can also click **Update sheet preview**. Adjust the settings if the layout reports a problem.
 
 If needed, change operation-layer colours or double-click a layer name below the preview to rename it. Renaming a layer does not change the operation's depth.
 
-Click **Export sheet DXFs…**. When the export finishes, click **Open export folder**. If the option to save and open a sheet layout is checked, the tool also opens a separate FreeCAD layout document.
+Click **Create sheet layout**. A new **Sheet layout** document opens in FreeCAD. **No DXF, SVG, STEP or part-list files are exported at this point.** You can inspect the grouped operations before choosing what to export.
 
-**Start with the `Sheet_*.dxf` files in your CAM software**, and read `SHEET_NOTES.txt` before setting up machining.
+### 4. Export when ready
+
+1. In the model tree, right-click **Sheet layouts — operations** and choose **Export all sheets…**. To export one sheet, right-click that sheet and choose **Export this sheet…**.
+2. Choose **DXF**, **SVG**, **DXF and SVG** or **Mozaik — R12 DXF**, then select the destination folder. When exporting all sheets from a newly created layout, **Include individual parts, STEP files and part lists** keeps the complete-package option available.
+3. Click **Export**. Each export creates a new timestamped folder; existing exports are kept. Use **Open export folder** in the completion message to find the files.
+
+The **SVG drawings use millimetres at 1:1 scale**, with exact circular arcs and named operation groups, including Inkscape-compatible layer labels. How groups are presented depends on the importing application. Standard DXF remains R2004; the Mozaik option writes R12. None of these formats creates toolpaths or assigns tools automatically.
+
+**For Mozaik part import:** choose **Mozaik — R12 DXF** from **Export all sheets…** and keep **Include individual parts, STEP files and part lists** checked. Import the individual-part files ending in **`_R12.dxf`**, not the nested `Sheet_*` drawings. If that checkbox is unavailable on an older layout, create a new layout from the original model first. Single-sheet export remains available for R12 sheet drawings, but those are not individual-part import files.
+
+The R12 option uses **closed 2D polylines only**. Circular holes use four exact quarter-circle arcs; rounded outlines keep their arcs. It omits sheet borders, margin lines, labels and other reference guides. Coordinates are millimetres, so select **mm** when importing: R12 does not carry the newer automatic insertion-unit setting. R12 uses indexed colours and shorter layer names; **`R12_LAYERS.csv`** maps any shortened names to their original operation names.
+
+Use FreeCAD’s normal **File → Save** to keep the layout as an `.FCStd` file for later. Its export data is saved with it, so the source model does not have to stay open. The Lay Flat macro and `lay_flat_sheet.py` companion must be installed on the computer that opens it for the right-click actions to work.
+
+Older layouts can gain sheet-only export actions by running **Lay Flat for CNC** with that layout active. Create a new layout from the source model if you need the complete individual-part package. Running the macro on a new layout opens its export dialog as a fallback to right-clicking.
+
+Layouts are generated snapshots. Changing selection, quantities, rotations or machining geometry requires a new layout. If its operation geometry is edited directly in the tree, export stops rather than silently exporting the earlier geometry.
+
+**Start with the `Sheet_*.dxf` or `Sheet_*.svg` files in CAM**, and read `SHEET_NOTES.txt` before setting up machining.
+
+### Read the sheet layout by operation
+
+The sheet layout groups matching operations **once per sheet**, rather than repeating them under every part. Expand a sheet to see items such as **Outside profiles — through**, **Pockets — depth 6 mm** and **Holes — diameter 10 mm — through**. Selecting one item highlights all of that operation's geometry on the sheet. Different hole diameters, depths and drill-tip depths remain separate.
+
+Each label includes an explicit sheet number, such as **(Sheet 1)**, so FreeCAD does not add unexplained duplicate-name suffixes. The part labels on the drawing use short part numbers. Select an operation to see its exact **DxfLayer**, feature count, part count and contributing part numbers and names in the Data properties.
+
+**Guides — not cuts** contains the sheet boundary, margin, part labels, grain arrows and any finishing guides. The 3D reference copies remain in a separate, initially hidden group. This organisation does not set a machining sequence or create toolpaths.
+
+DXF and SVG sheet drawings share operation layers/groups across parts. The tree organisation does not change machining geometry. For example, `HOLE_D10_THROUGH` means holes of **10 mm diameter, through the material**. A suffix such as `013` on an older FreeCAD preview label was an object label suffix, not part of that DXF layer name or a machining depth. Generate a new sheet layout to use the grouping.
+
+### CAM import notes
+
+- **VCarve:** [Vectric documents selection by layer and reusable toolpath templates](https://docs.vectric.com/docs/V12.5/VCarvePro/ENU/Help/page/single-page/#vector-selector). Select the relevant layer and assign the tool, depth and machining operation in CAM. Layer names alone do not create toolpaths.
+- **Mozaik:** its [documented DXF part import](https://mozaik.support.cyncly.com/hc/en-us/articles/44482897665169-Optimizer-Parts-Tab-Customer-Guide) requires **ACAD R12 closed polylines** and does not automatically assign tools to custom operations. The **Mozaik — R12 DXF** option targets that requirement. Use individual-part files, choose millimetres on import and assign machining tools inside Mozaik. The preset's file structure and geometry have been checked; an actual Mozaik import is still **unverified**.
+
+End-to-end import into either application has not been verified.
 
 ## What is in the export folder?
 
+Sheet-only export contains the selected sheet drawings, `manifest.json` and `SHEET_NOTES.txt`; R12 exports also include `R12_LAYERS.csv`. The complete-package checkbox adds the individual part drawings, STEP, CSV and FreeCAD files below.
+
+In filenames such as `Sheet_01_18MM_UP.dxf`, **UP** means the upward-facing machining setup shown in the drawing. It is not an additional operation or a second sheet.
+
 | File | What it is for |
 | --- | --- |
-| `Sheet_*.dxf` | The arranged sheet drawings, showing the upper machining face. |
-| Individual part `.dxf` files | Drawings of each exported part on its own. |
+| `Sheet_*.dxf` / `Sheet_*.svg` | Arranged sheet drawings in the formats you selected, showing the upper machining face. |
+| Individual part `.dxf` / `.svg` files | Drawings of each part on its own, when the complete package is selected. |
 | Individual part `.step` files | 3D export solids, including features on both sides and the chosen fillet-removal setting. |
 | `Flat_parts.FCStd` | A FreeCAD document containing the flattened 3D parts. |
-| `Sheet_layout.FCStd` | An optional FreeCAD sheet-layout preview. |
+| `Sheet_layout.FCStd` | Saved sheet layout with right-click export actions, included when the complete-package preview is created successfully. |
 | `parts.csv` and `quantities.csv` | Part dimensions, sheet placements and quantities; open these in a spreadsheet. |
 | `SHEET_NOTES.txt` | Machining notes and explanations of reference layers. |
 | `manifest.json` | Detailed export records, including operation depths, underside features and fillet-removal results. |
+| `R12_LAYERS.csv` | Mozaik/R12 exports only: maps shortened R12 layer names to the original operation names. |
 
 ## Optional: remember which parts are panels
 
@@ -129,7 +185,7 @@ In either selection dialog, searching only hides rows: **checked rows remain che
 
 ## Limits to understand before machining
 
-- **Only the chosen upper face is drawn for machining.** Underside operations are recorded in the notes and `manifest.json`, and remain in the exact 3D files. No separate underside sheet layout is generated. Plan the second setup in CAM if your part needs one.
+- **Only the chosen upper face is drawn for machining.** The complete package records underside operations in its notes and `manifest.json`, and retains them in the 3D files. Sheet-only exports do not contain the full underside machining records. No separate underside sheet layout is generated. Plan the second setup in CAM if your part needs one.
 - **Sheet layout uses rectangular packing.** It leaves room around each part's machining boundaries. It does not nest irregular shapes together or guarantee the best material yield.
 - **Drawings are not finished toolpaths.** Reference layers and labels are not cuts. Taper and roundover guides still need cutter and toolpath setup in CAM.
 - **Fillet removal needs identifiable model history.** It supports native PartDesign fillets and verified whole-part references and Part mirrors. Imported solids, partial references and other modelling patterns are not automatically simplified. A copy with additional unaccounted geometry changes is rejected rather than losing those changes.
@@ -139,7 +195,7 @@ In either selection dialog, searching only hides rows: **checked rows remain che
 
 | Problem | What to try |
 | --- | --- |
-| The installer says the folder is incomplete | Extract the complete ZIP and select the folder containing all three macros and both icons. |
+| The installer says the folder is incomplete | Keep all three macros, both icons and `lay_flat_sheet.py` together, then select that extracted folder. |
 | The toolbar does not appear | Finish any active edit, then switch workbenches or restart FreeCAD. If installation failed, try the manual steps above. |
 | The parts I expected are not checked | Check them manually. Tags and individually selected parts start checked; untagged children of a selected assembly do not. |
 | Rounded corners remain in the export | Check **Remove fillets up to** in the part picker. The radius is inclusive; larger fillets remain. Imported solids without native fillet history are not simplified. Generate a new export after changing the setting. |
@@ -149,7 +205,9 @@ In either selection dialog, searching only hides rows: **checked rows remain che
 | Thickness cannot be detected reliably | Try selecting a broad flat face on the part before running the tool. This can guide flattening. |
 | A part will not fit, or grain does not line up | Check its rotation, sheet dimensions, margins, gap and grain settings, then update the preview. |
 | A linked array cannot be exported | Expand it into individual component links first. The tool does not guess array quantities. |
-| The tool says this is an export preview | Switch back to your original model's document tab and run it there. |
+| There is no right-click export action on an older layout | Run **Lay Flat for CNC** with that layout active to enable sheet-only export. The companion file must be installed. |
+| The export menu is missing after reopening a saved layout | Install the complete package on this computer, including `lay_flat_sheet.py`, then reopen the layout. |
+| Export says the layout geometry changed | Undo the geometry edits or create a fresh layout from the original model. |
 | An unexpected error occurs | Open **View → Panels → Report View** for details. |
 
 <details>

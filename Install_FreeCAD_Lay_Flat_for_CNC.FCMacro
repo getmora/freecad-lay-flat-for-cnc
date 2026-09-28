@@ -10,7 +10,7 @@ import FreeCADGui as Gui
 from PySide import QtWidgets
 
 FILES = ('FreeCAD_Lay_Flat_for_CNC.FCMacro', 'Panel_Tags.FCMacro',
-         'lay-flat-for-cnc.svg', 'panel-tags.svg')
+         'lay-flat-for-cnc.svg', 'panel-tags.svg', 'lay_flat_sheet.py')
 LEGACY_MACROS = {'FreeCAD_Lay_Flat_for_CNC.FCMacro': 'Mestra_Flat_Export.FCMacro',
                  'Panel_Tags.FCMacro': 'Mestra_Panel_Tags.FCMacro'}
 COMMANDS = (
@@ -41,7 +41,7 @@ def install(folder):
     for name in FILES:
         source = folder / name
         if not source.is_file():raise ValueError('Download is missing ' + name)
-        if name.endswith('.FCMacro'):compile(source.read_text(encoding='utf-8'), str(source), 'exec')
+        if name.endswith(('.FCMacro', '.py')):compile(source.read_text(encoding='utf-8'), str(source), 'exec')
     backup = None
     old_files = {}
     copied = []

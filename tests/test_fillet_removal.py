@@ -7,7 +7,7 @@ import FreeCAD as App
 import Part
 
 MACRO = Path(__file__).resolve().parents[1] / 'FreeCAD_Lay_Flat_for_CNC.FCMacro'
-macro = {'__name__': 'layflat_test'}
+macro = {'__name__': 'layflat_test', '__file__': str(MACRO)}
 exec(compile(MACRO.read_text(), str(MACRO), 'exec'), macro)
 
 

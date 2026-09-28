@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""FreeCAD Lay Flat for CNC 0.12.4 -- self-contained FreeCAD macro, millimetres.
+"""FreeCAD Lay Flat for CNC 0.12.8 -- FreeCAD macro, millimetres. Requires lay_flat_sheet.py.
 
 Run in FreeCAD. Select finished Bodies/parts (optional); otherwise the dialog
 lists Bodies. Each solid is one part. Source objects are never changed.
@@ -26,7 +26,7 @@ from pathlib import Path
 import FreeCAD as App
 import Part
 
-VERSION = '0.12.4'
+VERSION = '0.12.8'
 PANEL_TAG = 'LayFlatPanel'
 STOCK_THICKNESS_TOL = 0.05
 TOL = 1e-5
@@ -36,6 +36,19 @@ Z = App.Vector(0, 0, 1)
 
 class ExportError(Exception):
     """Geometry or output that cannot be exported without guessing."""
+
+
+def sheet_runtime():
+    """Load the installed companion that restores saved right-click menus."""
+    import sys
+    folder = Path(globals().get('__file__', App.getUserMacroDir(True))).resolve()
+    if folder.is_file():folder = folder.parent
+    if str(folder) not in sys.path:sys.path.insert(0, str(folder))
+    try:
+        import lay_flat_sheet
+    except ImportError as exc:
+        raise ExportError('The sheet export companion is missing. Install the complete Lay Flat package, including lay_flat_sheet.py.') from exc
+    return lay_flat_sheet
 
 
 def mm(value):
@@ -692,6 +705,14 @@ def apply_layer_settings(parts, settings):
     return result
 
 
+def apply_layout_styles(parts, sheets, styles):
+    """Refresh operation styling without repeating validated sheet packing."""
+    parts = apply_layer_settings(parts, styles)
+    sheets = [dict(sheet, placements=[dict(placement, part=parts[placement['part_index']-1])
+                                     for placement in sheet['placements']]) for sheet in sheets]
+    return parts, sheets
+
+
 def palette_for_parts(parts):
     operations = [op for p in parts for op in p['operations']]
     defaults = make_layer_palette(op.get('source_layer', op['layer']) for op in operations)
@@ -1256,12 +1277,17 @@ def sheet_drawing(sheet, side, settings, palette=None):
     return drawing
 
 
-def output_parts(parts, parent, title='FreeCAD_Lay_Flat_for_CNC', create_preview=True, settings=None):
+def output_parts(parts, parent, title='FreeCAD_Lay_Flat_for_CNC', create_preview=True, settings=None, drawing_formats=('dxf',), expected_layout=None):
     """Write individual DXFs and bounded sheet DXFs into a fresh directory."""
     # Preserve the callable API for callers supplying unconfigured analysed parts.
+    drawing_formats = sheet_runtime().validate_formats(drawing_formats)
     parts = [p if 'machining_bounds_mm' in p else apply_part_options(p) for p in parts]
     settings = {'by_thickness': stock_profiles(parts, settings)}
     sheets = pack_sheets(parts, settings)
+    if expected_layout is not None:
+        placements = [[{k:v for k,v in p.items() if k != 'part'} for p in sheet['placements']] for sheet in sheets]
+        if placements != [sheet['placements'] for sheet in expected_layout]:
+            raise ExportError('The saved layout cannot be reproduced exactly; export the sheet drawings only.')
     palette = palette_for_parts(parts)
     parent = Path(parent)
     if not parent.is_dir():
@@ -1273,7 +1299,10 @@ def output_parts(parts, parent, title='FreeCAD_Lay_Flat_for_CNC', create_preview
                 'machining_face': 'Each panel is oriented with its most recessed machining features UP. Only this setup is drawn; underside features are reported separately.',
                 'underside_geometry': 'Exact STEP and FCStd solids retain both sides. No separate underside DXF or sheet layout is generated.',
                 'layout': 'Fixed-orientation rectangular packing of all machining envelopes, including rebate extensions. Reference and label layers are not toolpaths.',
-                'stock_settings': settings, 'dxf_version': 'R2004', 'layer_colours': palette, 'parts': [], 'sheets': []}
+                'stock_settings': settings, 'drawing_formats': list(drawing_formats), 'dxf_version': 'R12' if 'dxf_r12' in drawing_formats and 'dxf' not in drawing_formats else 'R2004', 'layer_colours': palette, 'parts': [], 'sheets': []}
+    if 'dxf_r12' in drawing_formats:
+        manifest['mozaik_import_verified'] = False
+        manifest['r12_layer_names'] = sheet_runtime().r12_layer_names(palette)
     placements_by_index = {p['part_index']: (s, p) for s in sheets for p in s['placements']}
     try:
         for index, part in enumerate(parts, 1):
@@ -1317,23 +1346,22 @@ def output_parts(parts, parent, title='FreeCAD_Lay_Flat_for_CNC', create_preview
                                  0, part['machining_bounds_mm'][1] - 12)
                 for note_index, note in enumerate(cut_annotations(part, side)):
                     drawing.add_text(note, 3, part['height_mm']/2 + note_index*6, 4)
-                filename = part_id + '_' + face_label(side) + '.dxf'
-                drawing.save(staging / filename)
-                record['files'].append(filename)
+                record['files'].extend(sheet_runtime().write_drawing(drawing, staging, part_id+'_'+face_label(side),
+                    drawing_formats, part['width_mm'], part['height_mm'], bounds=part['machining_bounds_mm']))
             manifest['parts'].append(record)
         for sheet in sheets:
             record = {k: sheet[k] for k in ('index', 'width_mm', 'height_mm', 'thickness_mm', 'has_back', 'stock_settings')}
             record['placements'] = [{k: v for k, v in p.items() if k != 'part'} for p in sheet['placements']]
             record['files'] = []
             for side in ['FRONT'] + (['BACK'] if sheet['has_back'] else []):
-                filename = 'Sheet_%02d_%sMM_%s.dxf' % (sheet['index'], token(sheet['thickness_mm']), face_label(side))
-                sheet_drawing(sheet, side, settings, palette).save(staging / filename)
-                record['files'].append(filename)
+                basename = 'Sheet_%02d_%sMM_%s' % (sheet['index'], token(sheet['thickness_mm']), face_label(side))
+                record['files'].extend(sheet_runtime().write_drawing(sheet_drawing(sheet, side, settings, palette),
+                    staging, basename, drawing_formats, sheet['width_mm'], sheet['height_mm']))
             manifest['sheets'].append(record)
         with open(staging / 'parts.csv', 'w', newline='', encoding='utf-8-sig') as stream:
             writer = csv.writer(stream)
             writer.writerow(['Part', 'Label', 'Width_mm', 'Height_mm', 'Thickness_mm', 'Rotation_deg', 'Grain_axis_on_sheet',
-                             'Rebate_extension_mm', 'Sheet', 'Sheet_X_mm', 'Sheet_Y_mm', 'DXF_files',
+                             'Rebate_extension_mm', 'Sheet', 'Sheet_X_mm', 'Sheet_Y_mm', 'Drawing_files',
                              'Source_row', 'Copy_number', 'Row_quantity', 'Assembly_instance'])
             for r in manifest['parts']:
                 writer.writerow([r['id'], r['label'], mm(r['width_mm']), mm(r['height_mm']), mm(r['thickness_mm']), r['rotation_deg'],
@@ -1352,7 +1380,7 @@ def output_parts(parts, parent, title='FreeCAD_Lay_Flat_for_CNC', create_preview
             for q in manifest['quantities']:
                 writer.writerow([q['source_row'], q['label'], q['quantity'], mm(q['thickness_mm']), q['source_instance']])
         (staging / 'SHEET_NOTES.txt').write_text(
-            'Use the Sheet_*.dxf files for the sheet layout. All dimensions are millimetres.\n'
+            'Use the Sheet_*.dxf or Sheet_*.svg files for the sheet layout. All dimensions are millimetres. SVG page dimensions are 1:1.\n'
             'REFERENCE_SHEET, REFERENCE_MARGIN, REFERENCE_GRAIN, REFERENCE_OUTLINE and LABELS are not cutting operations.\n'
             'Each panel has its most complex machining face UP. Only one UP layout is exported per sheet.\n'
             'Any underside operations are listed in manifest.json and part notes; exact 3D files retain them.\n'
@@ -1363,20 +1391,22 @@ def output_parts(parts, parent, title='FreeCAD_Lay_Flat_for_CNC', create_preview
             'Quantities are total copies per source row; assembly instances are preserved separately. See quantities.csv.\n'
             'All depths are measured from the original board face. TIP distinguishes drill-tip depth from full-diameter depth.\n'
             'Operation layer names and colours are user-editable; original identifiers and exact depths remain in manifest.json.\n'
-            'DXF R2004 stores chosen RGB colours with an indexed colour fallback.\n'
+            'Standard DXF uses R2004/RGB colours. The Mozaik preset uses R12 closed polylines and indexed colours, omitting guides and labels. Choose millimetres on import.\n'
+            'For Mozaik part import, use individual-part *_R12.dxf files, not nested Sheet_* drawings. Assign tools inside Mozaik; actual Mozaik import is unverified. R12 layer aliases are listed in manifest.json.\n'
             'Flat_parts.FCStd and individual STEP files use the export geometry, including requested fillet removal. The source model is unchanged.\n'
             'Fillet removal includes the selected radius. It uses native PartDesign fillet history, never the radius of arbitrary arcs or holes. See each part\'s fillet_removal record in manifest.json.\n'
             'STEP/imported solids without native fillet history keep their fillets. A cutoff of 0 disables removal.\n'
             'TAPER layers give wide and narrow contours with angle and start/end depths from the named board face. These are geometry for CAM setup, not cutter-compensated toolpaths.\n'
             'REFERENCE_TAPER and REFERENCE_EDGE_ROUND layers are guides, not through cuts. Rounded finishing regions are envelopes; use the exact STEP surface for cutter setup.\n'
             'Parts were manually selected. Panel tags are selection defaults; names, STEP origin and thickness never exclude solid parts. Thickness is measured from geometry.\n', encoding='utf-8')
+        if 'dxf_r12' in drawing_formats:sheet_runtime().write_r12_layer_guide(staging, palette)
         save_flat_solids(sheets, staging / 'Flat_parts.FCStd')
         manifest['flat_parts_file']='Flat_parts.FCStd'
         manifest['preview'] = {'requested': bool(create_preview), 'created': False}
         if create_preview:
             preview_path = staging / 'Sheet_layout.FCStd'
             try:
-                save_sheet_preview(sheets, settings, preview_path, palette)
+                save_sheet_preview(sheets, settings, preview_path, palette, title=title)
                 manifest['preview'].update({'created': True, 'file': preview_path.name})
             except Exception as exc:
                 # DXF generation succeeded: report an optional preview failure
@@ -1395,20 +1425,94 @@ def output_parts(parts, parent, title='FreeCAD_Lay_Flat_for_CNC', create_preview
         raise
 
 
-def save_sheet_preview(sheets, settings, path, palette=None):
+def operation_description(op):
+    """Human-readable machining meaning, independent of object numbering."""
+    kind = op['kind']
+    depth = 'through' if op.get('depth_mm') is None else 'depth %s mm' % mm(op['depth_mm'])
+    if op['layer'] == 'REFERENCE_OUTLINE':
+        text = 'Part outlines — guide only'
+    elif kind == 'OUTLINE':
+        text = 'Outside profiles — through'
+    elif kind == 'CUTOUT':
+        text = 'Internal cutouts — through'
+    elif kind == 'HOLE':
+        text = 'Holes — diameter %s mm — %s' % (mm(op['diameter_mm']), depth)
+        if op.get('tip_depth_mm') is not None:
+            text += ' — drill tip depth %s mm' % mm(op['tip_depth_mm'])
+    elif kind == 'POCKET':
+        text = 'Pockets — ' + depth
+    elif kind == 'TAPER':
+        text = 'Taper — %s° — %s contour — depth %s to %s mm' % (
+            mm(op['angle_deg']), op['contour'], mm(op['start_depth_mm']), mm(op['end_depth_mm']))
+    elif kind == 'EDGE_ROUND':
+        text = 'Roundover — radius %s mm' % mm(op['radius_mm'])
+    else:
+        text = op['layer']
+    if op.get('reference_only'):
+        text += ' — guide only'
+    if op.get('source_layer', op['layer']) != op['layer'] and op['layer'] != 'REFERENCE_OUTLINE':
+        text = op['layer'] + ' — ' + text
+    return text
+
+
+def grouped_sheet_operations(sheet, side):
+    """One layer object per sheet/setup, with complete part provenance."""
+    groups = {}
+    for placement in sheet['placements']:
+        for op in face_operations(placement['part'], side):
+            group = groups.setdefault(op['layer'], {'layer': op['layer'], 'operation': op,
+                'wires': [], 'feature_count': 0, 'parts': {}})
+            group['wires'].extend(placed_wire(wire, placement, sheet, side) for wire in op['face'].Wires)
+            group['feature_count'] += 1
+            group['parts'][placement['part_index']] = placement['part']['label']
+    ranks = {'OUTLINE': 0, 'CUTOUT': 1, 'POCKET': 2, 'HOLE': 3, 'TAPER': 4}
+    return sorted(groups.values(), key=lambda group: (
+        ranks.get(group['operation']['kind'], 5),
+        group['operation'].get('depth_mm') or 0,
+        group['operation'].get('diameter_mm') or 0, group['layer']))
+
+
+def add_sheet_operation(doc, parent, operation_group, context, offset_y, palette):
+    layer = operation_group['layer']
+    op = operation_group['operation']
+    obj = doc.addObject('Part::Feature', 'OperationLayer')
+    description = operation_description(op)
+    obj.Label = '%s (%s)' % (description, context)
+    obj.addProperty('App::PropertyString', 'DxfLayer', 'Export').DxfLayer = layer
+    obj.addProperty('App::PropertyString', 'Operation', 'Export').Operation = description
+    obj.addProperty('App::PropertyInteger', 'FeatureCount', 'Export').FeatureCount = operation_group['feature_count']
+    obj.addProperty('App::PropertyInteger', 'PartCount', 'Export').PartCount = len(operation_group['parts'])
+    obj.addProperty('App::PropertyStringList', 'PartNumbers', 'Export').PartNumbers = [str(i) for i in sorted(operation_group['parts'])]
+    obj.addProperty('App::PropertyStringList', 'PartLabels', 'Export').PartLabels = [operation_group['parts'][i] for i in sorted(operation_group['parts'])]
+    obj.addProperty('App::PropertyInteger', 'WireCount', 'Export').WireCount = len(operation_group['wires'])
+    shape = Part.makeCompound(operation_group['wires'])
+    shape.translate(App.Vector(0, offset_y, 0))
+    obj.Shape = shape
+    parent.addObject(obj)
+    if App.GuiUp:
+        obj.ViewObject.LineColor = layer_rgb(palette, layer)
+        obj.ViewObject.LineWidth = 2.0
+        obj.ViewObject.DisplayMode = 'Wireframe'
+        obj.ViewObject.Visibility = True
+    return obj
+
+
+def save_sheet_preview(sheets, settings, path=None, palette=None, title='Sheet layout'):
     if palette is None:
         palette = palette_for_parts([p['part'] for sheet in sheets for p in sheet['placements']])
     previous = App.ActiveDocument
-    doc = App.newDocument('FreeCADLayFlatSheetPreview')
+    doc = App.newDocument('Sheet_layout')
+    completed = False
     try:
-        doc.Label = 'FreeCAD Lay Flat for CNC — sheet layout'
+        doc.Label = 'Sheet layout'
         marker = doc.addObject('App::FeaturePython', 'FreeCADLayFlatSheetExportMarker')
         marker.Label = 'Export preview — use the original model for new exports'
-        drawings = doc.addObject('App::DocumentObjectGroup', 'SheetLayouts')
-        drawings.Label = 'Sheet layouts — DXF lines'
+        drawings = doc.addObject('App::DocumentObjectGroupPython', 'SheetLayouts')
+        drawings.Label = 'Sheet layouts — operations'
         reference_solids = doc.addObject('App::DocumentObjectGroup', 'ReferenceSolids')
         reference_solids.Label = '3D copies — reference only'
         solid_objects = []
+        sheet_objects = []
         offset_y = 0.0
         for sheet in sheets:
             sheet_profile = sheet['stock_settings']
@@ -1416,56 +1520,47 @@ def save_sheet_preview(sheets, settings, path, palette=None):
             solid_group.Label = 'Sheet %02d — 3D copies' % sheet['index']
             reference_solids.addObject(solid_group)
             for side in ['FRONT'] + (['BACK'] if sheet['has_back'] else []):
-                group = doc.addObject('App::DocumentObjectGroup', 'Sheet')
+                group = doc.addObject('App::DocumentObjectGroupPython', 'Sheet')
                 group.Label = 'Sheet %02d — %s — %s mm' % (sheet['index'], face_label(side), mm(sheet['thickness_mm']))
                 drawings.addObject(group)
+                if side == 'FRONT':sheet_objects.append(group)
+                context = 'Sheet %d%s' % (sheet['index'], ' underside' if side == 'BACK' else '')
+                guides = doc.addObject('App::DocumentObjectGroup', 'SheetGuides')
+                guides.Label = 'Guides — not cuts (%s)' % context
+                labels = doc.addObject('App::DocumentObjectGroup', 'SheetPartLabels')
+                labels.Label = 'Part labels (%s)' % context
+                guides.addObject(labels)
+                # Operation items appear first; reference geometry is kept separate.
+                for operation_group in grouped_sheet_operations(sheet, side):
+                    op = operation_group['operation']
+                    parent = guides if op.get('reference_only') or operation_group['layer'].startswith('REFERENCE_') else group
+                    add_sheet_operation(doc, parent, operation_group, context, offset_y, palette)
+                group.addObject(guides)
                 boundary = doc.addObject('Part::Feature', 'SheetBoundary')
-                boundary.Label = 'REFERENCE_SHEET'
+                boundary.Label = 'Sheet boundary (%s)' % context
                 boundary.Shape = rectangle_wire(sheet['width_mm'], sheet['height_mm'], 0, offset_y)
-                group.addObject(boundary)
+                guides.addObject(boundary)
                 if App.GuiUp:
                     boundary.ViewObject.LineColor = layer_rgb(palette, 'REFERENCE_SHEET')
                 margin = sheet_profile['margin_mm']
                 if margin > TOL:
                     obj = doc.addObject('Part::Feature', 'SheetMargin')
-                    obj.Label = 'REFERENCE_MARGIN'
+                    obj.Label = 'Edge margin (%s)' % context
                     obj.Shape = rectangle_wire(sheet['width_mm'] - 2 * margin, sheet['height_mm'] - 2 * margin, margin, offset_y + margin)
-                    group.addObject(obj)
+                    guides.addObject(obj)
                     if App.GuiUp:
                         obj.ViewObject.LineColor = layer_rgb(palette, 'REFERENCE_MARGIN')
+                grain_wires = []
                 for placement in sheet['placements']:
                     part = placement['part']
-                    sub = doc.addObject('App::DocumentObjectGroup', 'Panel')
-                    sub.Label = '%02d %s — %d°' % (placement['part_index'], part['label'], part['rotation_deg'])
-                    group.addObject(sub)
-                    for layer, operations in grouped_face_operations(part, side):
-                        obj = doc.addObject('Part::Feature', 'OperationLayer')
-                        obj.Label = layer
-                        obj.addProperty('App::PropertyString', 'DxfLayer', 'Export').DxfLayer = layer
-                        obj.addProperty('App::PropertyInteger', 'FeatureCount', 'Export').FeatureCount = len(operations)
-                        wires = [placed_wire(w, placement, sheet, side) for op in operations for w in op['face'].Wires]
-                        shape = Part.makeCompound(wires)
-                        shape.translate(App.Vector(0, offset_y, 0))
-                        obj.Shape = shape
-                        sub.addObject(obj)
-                        if App.GuiUp:
-                            obj.ViewObject.LineColor = layer_rgb(palette, layer)
-                            obj.ViewObject.LineWidth = 2.0
-                            obj.ViewObject.DisplayMode = 'Wireframe'
-                            obj.ViewObject.Visibility = True
                     x = placement['x_mm'] if side == 'FRONT' else sheet['width_mm'] - placement['x_mm'] - part['width_mm']
                     y = placement['y_mm'] + offset_y
                     segments = grain_segments(x, y, part['width_mm'], part['height_mm'], part['grain_axis_on_sheet'])
-                    if segments:
-                        obj = doc.addObject('Part::Feature', 'GrainDirection')
-                        obj.Label = 'REFERENCE_GRAIN'
-                        obj.Shape = Part.makeCompound([Part.makeLine(App.Vector(a[0], a[1], 0), App.Vector(b[0], b[1], 0)) for a, b in segments])
-                        sub.addObject(obj)
-                        if App.GuiUp:
-                            obj.ViewObject.LineColor = layer_rgb(palette, 'REFERENCE_GRAIN')
+                    grain_wires.extend(Part.makeLine(App.Vector(a[0], a[1], 0), App.Vector(b[0], b[1], 0)) for a, b in segments)
                     if side == 'FRONT':
                         obj = doc.addObject('Part::Feature', 'FlatPanel')
-                        obj.Label = '3D copy — ' + part['label']
+                        obj.Label = 'Part %02d — 3D reference (%s)' % (placement['part_index'], context)
+                        obj.addProperty('App::PropertyString', 'PartDescription', 'Export').PartDescription = part['label']
                         copy = part['shape'].copy()
                         # The reference solid is entirely below the Z=0 drawing
                         # plane. Even Show All cannot put it over the DXF lines
@@ -1482,17 +1577,28 @@ def save_sheet_preview(sheets, settings, path, palette=None):
                             obj.ViewObject.Visibility = False
                     if App.GuiUp:
                         label = doc.addObject('App::Annotation', 'PartLabel')
-                        label.LabelText = ['%02d %s' % (placement['part_index'], part['label'])]
+                        label.Label = 'Part %02d (%s)' % (placement['part_index'], context)
+                        label.LabelText = ['%02d' % placement['part_index']]
+                        label.addProperty('App::PropertyString', 'PartDescription', 'Export').PartDescription = part['label']
                         label.Position = App.Vector(x + 3, y + 3, 0)
                         label.ViewObject.FontSize = 5
-                        sub.addObject(label)
+                        labels.addObject(label)
+                if grain_wires:
+                    obj = doc.addObject('Part::Feature', 'GrainDirection')
+                    obj.Label = 'Grain direction (%s)' % context
+                    obj.Shape = Part.makeCompound(grain_wires)
+                    guides.addObject(obj)
+                    if App.GuiUp:
+                        obj.ViewObject.LineColor = layer_rgb(palette, 'REFERENCE_GRAIN')
                 if App.GuiUp:
                     label = doc.addObject('App::Annotation', 'SheetLabel')
+                    label.Label = 'Sheet title (%s)' % context
                     label.LabelText = [group.Label + ' — stock grain ' + sheet_profile['grain_axis']]
                     label.Position = App.Vector(0, offset_y - 20, 0)
                     label.ViewObject.FontSize = 10
-                    group.addObject(label)
+                    guides.addObject(label)
                 offset_y += sheet['height_mm'] + 150
+        sheet_runtime().bind_layout(doc, drawings, sheet_objects, sheets, settings, palette, globals(), title)
         doc.recompute()
         if App.GuiUp:
             import FreeCADGui as Gui
@@ -1504,11 +1610,13 @@ def save_sheet_preview(sheets, settings, path, palette=None):
                 obj.ViewObject.Visibility = False
             Gui.activeDocument().activeView().viewTop()
             Gui.activeDocument().activeView().fitAll()
-        doc.saveAs(str(path))
+        if path is not None:doc.saveAs(str(path))
+        completed = True
+        return doc if path is None else None
     finally:
-        App.closeDocument(doc.Name)
-        if previous is not None:
-            App.setActiveDocument(previous.Name)
+        if path is not None or not completed:
+            App.closeDocument(doc.Name)
+            if previous is not None:App.setActiveDocument(previous.Name)
 
 
 def object_id(obj):
@@ -1838,7 +1946,7 @@ def transfer_fillet_copy(original, prepared, target, label):
     return matches[0]
 
 
-def inherited_fillet_copy(obj, maximum_radius, ancestors):
+def inherited_fillet_copy(obj, maximum_radius, ancestors, cache):
     """Resolve whole-shape references/mirrors without changing any document."""
     upstream = None
     if obj.TypeId == 'PartDesign::SubShapeBinder':
@@ -1852,7 +1960,7 @@ def inherited_fillet_copy(obj, maximum_radius, ancestors):
         upstream = obj.BaseFeature
     if upstream is None:
         return None
-    prepared, report = remove_small_fillets(upstream, maximum_radius, ancestors)
+    prepared, report = remove_small_fillets(upstream, maximum_radius, ancestors, cache)
     if report['status'] != 'removed':
         return obj.Shape.copy(), report
     original = upstream.Shape.copy()
@@ -1866,11 +1974,23 @@ def inherited_fillet_copy(obj, maximum_radius, ancestors):
     return result, report
 
 
-def remove_small_fillets(body, maximum_radius, ancestors=()):
-    """Defeature a copy using native fillet history, never arc size alone."""
+def remove_small_fillets(body, maximum_radius, ancestors=(), cache=None):
+    """Share preparation across linked/mirrored sources within one operation."""
     maximum_radius = float(maximum_radius)
     if not math.isfinite(maximum_radius) or maximum_radius < 0:
         raise ExportError('The fillet cutoff must be a finite, non-negative radius.')
+    identity = object_id(body)
+    if maximum_radius and (identity in ancestors or len(ancestors) >= 64):
+        raise ExportError('Circular or excessively nested fillet source history in ' + body.Label)
+    cache = {} if cache is None else cache
+    key = (identity, maximum_radius)
+    if key not in cache:
+        cache[key] = _prepare_fillets(body, maximum_radius, ancestors, cache)
+    return cache[key]
+
+
+def _prepare_fillets(body, maximum_radius, ancestors, cache):
+    """Defeature a copy using native fillet history, never arc size alone."""
     original = body.Shape.copy()
     report = {'maximum_radius_mm': maximum_radius, 'inclusive': True,
               'removed_features': [], 'removed_faces': 0, 'added_volume_mm3': 0.0}
@@ -1878,9 +1998,7 @@ def remove_small_fillets(body, maximum_radius, ancestors=()):
         report['status'] = 'disabled'
         return original, report
     identity = object_id(body)
-    if identity in ancestors or len(ancestors) >= 64:
-        raise ExportError('Circular or excessively nested fillet source history in ' + body.Label)
-    inherited = inherited_fillet_copy(body, maximum_radius, ancestors + (identity,))
+    inherited = inherited_fillet_copy(body, maximum_radius, ancestors + (identity,), cache)
     if inherited is not None:
         return inherited
     if body.TypeId != 'PartDesign::Body':
@@ -1972,11 +2090,7 @@ def remove_small_fillets(body, maximum_radius, ancestors=()):
 def prepare_candidate(candidate, maximum_radius=0, cache=None):
     """Keep each assembly instance's placement while sharing source processing."""
     source = App.getDocument(candidate['source_document']).getObject(candidate['source_object'])
-    cache = {} if cache is None else cache
-    key = (object_id(source), float(maximum_radius))
-    if key not in cache:
-        cache[key] = remove_small_fillets(source, maximum_radius)
-    prepared, report = cache[key]
+    prepared, report = remove_small_fillets(source, maximum_radius, cache=cache)
     if report['status'] != 'removed':
         return candidate['shape'], dict(report)
     original = source.Shape.Solids[0]
@@ -2163,18 +2277,9 @@ def configure_parts(parts, QtWidgets, QtCore, QtGui, parent):
     if underside:
         note=QtWidgets.QLabel('%d selected part(s) also have underside machining. It is listed in the part notes and manifest, and retained in 3D; the UP DXFs cover the upper face only.'%len(underside))
         note.setWordWrap(True);outer_layout.addWidget(note)
-    folder_row = QtWidgets.QHBoxLayout()
-    folder_row.addWidget(QtWidgets.QLabel('Export folder'))
-    directory_edit = QtWidgets.QLineEdit(str(Path.home() / 'Documents'))
-    directory_edit.setToolTip('A new, timestamped export folder will be created inside this folder.')
-    folder_row.addWidget(directory_edit, 1)
-    browse_button = QtWidgets.QPushButton('Browse…')
-    folder_row.addWidget(browse_button)
-    outer_layout.addLayout(folder_row)
-    folder_note = QtWidgets.QLabel('Each export creates a new folder with DXFs, exact STEP parts and Flat_parts.FCStd. Existing exports are kept.')
-    folder_note.setWordWrap(True)
-    outer_layout.addWidget(folder_note)
-    status = QtWidgets.QLabel('Choose an export folder, then adjust the panels below.')
+    note = QtWidgets.QLabel('Create a sheet layout first. Then right-click Sheet layouts or an individual sheet to export DXF, SVG, or both. No files are exported until you choose Export.')
+    note.setWordWrap(True);outer_layout.addWidget(note)
+    status = QtWidgets.QLabel('Adjust the panels below, then create the sheet layout.')
     status.setWordWrap(True)
     status.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
     outer_layout.addWidget(status)
@@ -2201,18 +2306,8 @@ def configure_parts(parts, QtWidgets, QtCore, QtGui, parent):
     scroll.setWidget(content)
     outer_layout.addWidget(scroll, 1)
 
-    def browse_directory():
-        try:
-            current = directory_edit.text().strip()
-            chosen = QtWidgets.QFileDialog.getExistingDirectory(dialog, 'Choose the export folder', current or str(Path.home() / 'Documents'))
-            if chosen:
-                directory_edit.setText(chosen)
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(dialog, 'Could not choose a folder', str(exc))
-
-    browse_button.clicked.connect(browse_directory)
     table = QtWidgets.QTableWidget(len(parts), 7)
-    table.setHorizontalHeaderLabels(['Part — checked = export', 'Size before rotation (mm)', 'Quantity', 'Rotation', 'Grain before rotation', 'Extend rebates', 'Flip over'])
+    table.setHorizontalHeaderLabels(['Part — checked = include', 'Size before rotation (mm)', 'Quantity', 'Rotation', 'Grain before rotation', 'Extend rebates', 'Flip over'])
     table.verticalHeader().setVisible(False)
     table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
     for column in range(1, 7):
@@ -2309,9 +2404,6 @@ def configure_parts(parts, QtWidgets, QtCore, QtGui, parent):
     colour_key.setEditTriggers(QtWidgets.QAbstractItemView.DoubleClicked | QtWidgets.QAbstractItemView.EditKeyPressed)
     colour_key.setMaximumHeight(145)
     layout.addWidget(colour_key)
-    preview_file = QtWidgets.QCheckBox('Save and open the sheet layout in a new FreeCAD document after export')
-    preview_file.setChecked(True)
-    outer_layout.addWidget(preview_file)
     button_row = QtWidgets.QHBoxLayout()
     update = QtWidgets.QPushButton('Update sheet preview')
     button_row.addWidget(update)
@@ -2321,7 +2413,7 @@ def configure_parts(parts, QtWidgets, QtCore, QtGui, parent):
     button_row.addWidget(auto_preview)
     button_row.addStretch()
     buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
-    buttons.button(QtWidgets.QDialogButtonBox.Ok).setText('Export sheet DXFs…')
+    buttons.button(QtWidgets.QDialogButtonBox.Ok).setText('Create sheet layout')
     buttons.rejected.connect(dialog.reject)
     button_row.addWidget(buttons)
     outer_layout.addLayout(button_row)
@@ -2337,6 +2429,11 @@ def configure_parts(parts, QtWidgets, QtCore, QtGui, parent):
     style_timer.setSingleShot(True)
 
     def build():
+        cached = preview_state['cached']
+        if cached is not None and not preview_state['dirty']:
+            configured, settings, sheets = cached
+            configured, sheets = apply_layout_styles(configured, sheets, layer_settings)
+            return configured, settings, sheets
         settings = {'by_thickness': {}}
         configured = []
         for row, part in enumerate(parts):
@@ -2458,13 +2555,10 @@ def configure_parts(parts, QtWidgets, QtCore, QtGui, parent):
         try:
             cached = preview_state['cached']
             if cached is not None and not preview_state['dirty']:
-                configured, settings = cached
-                configured = apply_layer_settings(configured, layer_settings)
-                # Only names/colours change here; no geometry extraction,
-                # rotation or rebate booleans are repeated.
-                sheets = pack_sheets(configured, settings)
+                configured, settings, sheets = cached
+                configured, sheets = apply_layout_styles(configured, sheets, layer_settings)
                 render(sheets, settings)
-                preview_state['cached'] = (configured, settings)
+                preview_state['cached'] = (configured, settings, sheets)
                 status.setText('Layer names and colours updated. The export will use these settings.')
             else:
                 refresh_layer_key(apply_layer_settings(parts, layer_settings))
@@ -2535,7 +2629,7 @@ def configure_parts(parts, QtWidgets, QtCore, QtGui, parent):
         try:
             configured, settings, sheets = build()
             render(sheets, settings)
-            preview_state['cached'] = (configured, settings)
+            preview_state['cached'] = (configured, settings, sheets)
             preview_state['dirty'] = False
             extended = sum(p['extended_open_edges'] for p in configured)
             underside_count=sum(p['underside_feature_count'] for p in configured)
@@ -2577,27 +2671,16 @@ def configure_parts(parts, QtWidgets, QtCore, QtGui, parent):
             status.setText('Automatic preview is off. The current preview is up to date.')
 
 
-    def accept_export():
+    def accept_layout():
         auto_timer.stop()
         style_timer.stop()
-        raw_directory = directory_edit.text().strip()
-        if not raw_directory:
-            QtWidgets.QMessageBox.warning(dialog, 'Choose an export folder', 'Choose where to save the export using the Export folder field or Browse button.')
-            return
-        directory = Path(raw_directory).expanduser()
-        if not directory.is_absolute():
-            QtWidgets.QMessageBox.warning(dialog, 'Choose an export folder', 'Use Browse to select a folder, or enter its full path.')
-            return
-        if not directory.is_dir():
-            QtWidgets.QMessageBox.warning(dialog, 'Choose an existing folder', 'That folder does not exist or cannot be accessed. Use Browse to choose an existing folder.\n\n%s' % directory)
-            return
         error = None
-        status.setText('Checking the layout for export…')
+        status.setText('Checking the sheet layout…')
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
-            # Validate machining/layout independently of the on-screen drawing.
-            # A drawing-only failure must not masquerade as a failed export.
-            configured, settings, _sheets = build()
+            # An unchanged cached build has already passed geometry/packing
+            # checks. Dirty or absent previews still run the full validation.
+            configured, settings, sheets = build()
         except Exception as exc:
             error = str(exc)
             App.Console.PrintError('Lay Flat for CNC export validation: %s\n' % exc)
@@ -2608,15 +2691,14 @@ def configure_parts(parts, QtWidgets, QtCore, QtGui, parent):
             QtWidgets.QMessageBox.warning(dialog, 'Export stopped — no files saved', error)
             return
         chosen_result['parts'], chosen_result['settings'] = configured, settings
-        chosen_result['directory'] = str(directory)
-        chosen_result['create_preview'] = preview_file.isChecked()
+        chosen_result['sheets'] = sheets
         dialog.accept()
 
-    def export_clicked():
+    def create_layout_clicked():
         # Qt invokes slots outside run()'s exception handler. Catch every error
         # here too, otherwise an exception can look like an unresponsive button.
         try:
-            accept_export()
+            accept_layout()
         except Exception as exc:
             status.setText('Export stopped: %s' % exc)
             App.Console.PrintError(traceback.format_exc() + '\n')
@@ -2629,7 +2711,7 @@ def configure_parts(parts, QtWidgets, QtCore, QtGui, parent):
     colour_key.itemChanged.connect(layer_name_changed)
     dialog.finished.connect(lambda *_: auto_timer.stop())
     dialog.finished.connect(lambda *_: style_timer.stop())
-    buttons.accepted.connect(export_clicked)
+    buttons.accepted.connect(create_layout_clicked)
     for combo in rotations + grains + [widgets['grain'] for widgets in stock_controls.values()]:
         combo.currentIndexChanged.connect(invalidate)
     for widgets in stock_controls.values():
@@ -2648,58 +2730,6 @@ def configure_parts(parts, QtWidgets, QtCore, QtGui, parent):
     return chosen_result
 
 
-def show_export_result(destination, manifest, QtWidgets, QtCore, QtGui, parent):
-    """Make a completed export visible without confusing it with UI failures."""
-    import FreeCADGui as Gui
-    preview = manifest.get('preview', {})
-    preview_problem = preview.get('error')
-    opened_preview = False
-    if preview.get('created'):
-        path = destination / preview['file']
-        try:
-            if not path.is_file():
-                raise ExportError('The saved preview file could not be found: %s' % path)
-            document = App.openDocument(str(path))
-            if document is None:
-                raise ExportError('FreeCAD did not return a document for the saved preview.')
-            App.setActiveDocument(document.Name)
-            Gui.activeDocument().activeView().viewTop()
-            Gui.activeDocument().activeView().fitAll()
-            opened_preview = True
-        except Exception as exc:
-            preview_problem = str(exc)
-            App.Console.PrintWarning('Lay Flat for CNC DXFs are saved, but opening the sheet preview failed: %s\n' % exc)
-    box = QtWidgets.QMessageBox(parent)
-    box.setWindowTitle('Plywood export saved')
-    box.setIcon(QtWidgets.QMessageBox.Warning if preview_problem else QtWidgets.QMessageBox.Information)
-    box.setText('%d parts saved on %d sheet(s).' % (len(manifest['parts']), len(manifest['sheets'])))
-    info = 'Export location:\n%s\n\nUse Sheet_*.dxf for the sheet contours. Open Flat_parts.FCStd for the exact laid-flat plywood parts. Individual STEP files retain the full 3D cuts.' % destination
-    if opened_preview:
-        info += '\n\nThe sheet layout is now open in a new FreeCAD document. Close this message to view it.'
-    elif preview_problem:
-        info += '\n\nThe DXFs were saved, but the FreeCAD preview could not be opened:\n%s' % preview_problem
-    else:
-        info += '\n\nThe FreeCAD preview option was unchecked; only the export files were saved.'
-    box.setInformativeText(info)
-    filenames = [name for sheet in manifest['sheets'] for name in sheet['files']]
-    box.setDetailedText('\n'.join(filenames))
-    box.setStandardButtons(QtWidgets.QMessageBox.Ok)
-    folder_button = box.addButton('Open export folder', QtWidgets.QMessageBox.ActionRole)
-
-    def open_folder(*args):
-        try:
-            if not destination.is_dir():
-                raise ExportError('The export folder could not be found.')
-            if not QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(destination))):
-                raise ExportError('The system did not open the folder. You can copy the export location shown in this message.')
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(box, 'Could not open the folder', str(exc))
-
-    folder_button.clicked.connect(open_folder)
-    App.Console.PrintMessage('FreeCAD Lay Flat for CNC saved: %s\n' % destination)
-    box.exec()
-
-
 def run():
     import FreeCADGui as Gui
     try:
@@ -2713,7 +2743,13 @@ def run():
         return
     try:
         if doc.getObject('FreeCADLayFlatSheetExportMarker') is not None or doc.getObject('MestraSheetExportMarker') is not None:
-            raise ExportError('This is an export preview. Switch to your original model before running the macro.')
+            root = doc.getObject('SheetLayouts')
+            if root is not None and 'ExportPayload' in root.PropertiesList:
+                sheet_runtime().export_dialog(root)
+                return
+            root = sheet_runtime().upgrade_legacy_layout(doc)
+            sheet_runtime().export_dialog(root)
+            return
         skipped=[]
         candidates = collect_manufacturing_parts(doc, Gui.Selection.getSelectionEx(), skipped)
         candidates = choose_plywood_parts(candidates, skipped, QtWidgets, QtCore, parent)
@@ -2756,16 +2792,14 @@ def run():
         choice = configure_parts(parts, QtWidgets, QtCore, QtGui, parent)
         if choice is None:
             return
-        directory = choice['directory']
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
-        parent.statusBar().showMessage('Writing sheet DXFs…')
+        parent.statusBar().showMessage('Creating sheet layout…')
         try:
-            destination, manifest = output_parts(choice['parts'], directory, doc.Label,
-                create_preview=choice['create_preview'], settings=choice['settings'])
+            save_sheet_preview(choice['sheets'], choice['settings'], title=doc.Label)
         finally:
             QtWidgets.QApplication.restoreOverrideCursor()
             parent.statusBar().clearMessage()
-        show_export_result(destination, manifest, QtWidgets, QtCore, QtGui, parent)
+        App.Console.PrintMessage('Sheet layout created. Right-click Sheet layouts or a sheet to export DXF/SVG. No files have been exported.\n')
     except ExportError as exc:
         App.Console.PrintError('FreeCAD Lay Flat for CNC: %s\n' % exc)
         QtWidgets.QMessageBox.warning(parent, 'Export needs attention', str(exc))

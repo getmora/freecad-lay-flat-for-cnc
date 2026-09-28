@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Review individual panel tags inside selected parts, shelves or cabinets."""
 from pathlib import Path
-import runpy
+import sys
 import FreeCAD as App
 import FreeCADGui as Gui
 from PySide import QtCore, QtWidgets
@@ -111,7 +111,13 @@ def run():
     try:
         doc = App.ActiveDocument
         if doc is None:raise ValueError('Open a model and select parts, shelves or cabinets first.')
-        api = runpy.run_path(str(exporter_path()), run_name='lay_flat_panel_tag_library')
+        path = exporter_path()
+        if str(path.parent) not in sys.path:sys.path.insert(0, str(path.parent))
+        try:
+            import lay_flat_sheet
+        except ImportError as exc:
+            raise RuntimeError('The Lay Flat companion is missing. Reinstall the complete package, including lay_flat_sheet.py.') from exc
+        api = lay_flat_sheet.core(path)
         candidates, skipped = api['panel_tag_candidates'](doc, Gui.Selection.getSelectionEx())
         dialog = build_dialog(doc, candidates, skipped, parent)
         if dialog.exec() != QtWidgets.QDialog.Accepted:return
