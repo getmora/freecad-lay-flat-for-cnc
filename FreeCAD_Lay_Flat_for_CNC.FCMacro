@@ -1038,7 +1038,7 @@ def select_machining_face(part, flip_over=None):
     flip=chosen=='BACK'
     if flip:
         shape.rotate(App.Vector(),App.Vector(0,1,0),180)
-        box=shape.BoundBox;shape.translate(App.Vector(-box.XMin,-box.YMin,-box.ZMin))
+        box=shape.optimalBoundingBox();shape.translate(App.Vector(-box.XMin,-box.YMin,-box.ZMin))
     result['shape']=shape;result['operations']=[];result['underside_operations']=[]
     for original in part['operations']:
         op=dict(original);op['original_side']=original['side'];face=original['face'].copy()
@@ -1085,10 +1085,11 @@ def apply_part_options(part, rotation_deg=0, grain_axis='NONE', rebate_extension
     result['rebate_extension_mm'] = rebate_extension_mm
     shape = part['shape'].copy()
     shape.rotate(App.Vector(), Z, rotation_deg)
-    offset = App.Vector(-shape.BoundBox.XMin, -shape.BoundBox.YMin, 0)
+    box = shape.optimalBoundingBox()
+    offset = App.Vector(-box.XMin, -box.YMin, 0)
     shape.translate(offset)
     result['shape'] = shape
-    result['width_mm'], result['height_mm'] = shape.BoundBox.XLength, shape.BoundBox.YLength
+    result['width_mm'], result['height_mm'] = box.XLength, box.YLength
     operations = []
     for original in part['operations']:
         op = dict(original)
@@ -1112,7 +1113,7 @@ def apply_part_options(part, rotation_deg=0, grain_axis='NONE', rebate_extension
     if rebate_extension_mm > TOL:
         result['notes'].append('%d open rebate edge(s) extended by %s mm outside the finished outline.' % (extension_count, mm(rebate_extension_mm)))
     # Reserve all front AND back operations at the same physical placement.
-    boxes = [op['face'].BoundBox for op in operations]
+    boxes = [op['face'].optimalBoundingBox() for op in operations]
     result['machining_bounds_mm'] = [min(b.XMin for b in boxes), min(b.YMin for b in boxes),
                                      max(b.XMax for b in boxes), max(b.YMax for b in boxes)]
     result['extended_open_edges'] = extension_count
