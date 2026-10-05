@@ -163,9 +163,12 @@ def operation(kind, side, face, depth=None, diameter=None, tip_depth=None):
         # B-splines) are rebuilt as such; anything else fails validate_edges.
         try:
             wires = [Part.Wire([canonical_edge(e) for e in w.OrderedEdges]) for w in flat.Wires]
-            flat = flat_face(Part.makeFace(wires, 'Part::FaceMakerBullseye').Faces[0])
-        except Part.OCCError as exc:
+            rebuilt = Part.makeFace(wires, 'Part::FaceMakerBullseye').Faces
+        except (Part.OCCError, ValueError) as exc:
             raise ExportError('An operation boundary could not be rebuilt from exact lines and arcs.') from exc
+        if len(rebuilt) != 1:
+            raise ExportError('An operation boundary could not be rebuilt from exact lines and arcs.')
+        flat = flat_face(rebuilt[0])
     for wire in flat.Wires:
         validate_edges(wire)
     if kind == 'OUTLINE':
@@ -325,7 +328,7 @@ def extract_tapers(shape, faces):
     thickness=bounds.ZLength
     results=[]
     for low,high,angle,fs in groups:
-        angle=round(angle,6)+0.0
+        angle=round(angle,6)+0.0  # report e.g. 44.99999999997 as 45
         lower=level_wires(fs,low,bounds);upper=level_wires(fs,high,bounds)
         if not lower or len(lower)!=len(upper):raise ExportError('Taper boundary counts do not match.')
         used=set()
