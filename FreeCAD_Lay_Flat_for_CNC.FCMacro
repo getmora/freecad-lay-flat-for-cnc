@@ -31,6 +31,8 @@ PANEL_TAG = 'LayFlatPanel'
 STOCK_THICKNESS_TOL = 0.05
 TOL = 1e-5
 ANG_TOL = 1e-7
+TAPER_ANGLE_TOL_DEG = 1e-4  # taper faces whose angles agree this closely are one cut
+EXACT_FIT_TOL = 1e-6  # spline edges this close to a line or arc are rebuilt as one
 Z = App.Vector(0, 0, 1)
 
 
@@ -56,6 +58,7 @@ def mm(value):
 
 
 def token(value):
+    # + 0.0 turns -0.0 into 0.0, so a depth of -0.00000001 never becomes an M0 layer.
     return mm(round(value, 4) + 0.0).replace('.', 'P').replace('-', 'M')
 
 
@@ -125,13 +128,13 @@ def flatten_solid(solid, normal=None):
     for n in candidates:
         copy = solid.copy()
         copy.Placement = App.Placement(App.Vector(), App.Rotation(n, Z)).multiply(copy.Placement)
-        variants.append((copy.BoundBox.ZLength, copy))
+        variants.append((copy.optimalBoundingBox().ZLength, copy))
     thickness, copy = min(variants, key=lambda item: item[0])
     if thickness <= TOL:
         raise ExportError('Part has zero thickness.')
     # Resolve the automatic face sign towards the side with more recessed area.
     if normal is None:
-        bb = copy.BoundBox
+        bb = copy.optimalBoundingBox()
         scores = {1: 0.0, -1: 0.0}
         for face in copy.Faces:
             if is_horizontal(face) and bb.ZMin + TOL < face.CenterOfMass.z < bb.ZMax - TOL:
@@ -148,7 +151,7 @@ def flatten_solid(solid, normal=None):
         copy.rotate(App.Vector(), Z, -angle)
     bb = copy.optimalBoundingBox()
     copy.translate(App.Vector(-bb.XMin, -bb.YMin, -bb.ZMin))
-    if normal is None and copy.BoundBox.ZLength >= min(copy.BoundBox.XLength, copy.BoundBox.YLength) - TOL:
+    if normal is None and bb.ZLength >= min(bb.XLength, bb.YLength) - TOL:
         raise ExportError('Ambiguous board thickness. Select a broad planar face and run again.')
     return copy
 
@@ -156,10 +159,13 @@ def flatten_solid(solid, normal=None):
 def operation(kind, side, face, depth=None, diameter=None, tip_depth=None):
     flat = flat_face(face)
     if any(e.Length > TOL and not isinstance(e.Curve, (Part.Line, Part.Circle)) for e in flat.Edges):
-        wires = [Part.Wire(Part.__sortEdges__([canonical_edge(e) for e in w.Edges if e.Length > TOL])) for w in flat.Wires]
-        flat = Part.makeFace(wires, 'Part::FaceMakerBullseye').Faces[0]
-        if flat.normalAt(0, 0).z < 0:
-            flat.reverse()
+        # Spline edges that are exact lines or arcs (a chamfer written as
+        # B-splines) are rebuilt as such; anything else fails validate_edges.
+        try:
+            wires = [Part.Wire([canonical_edge(e) for e in w.OrderedEdges]) for w in flat.Wires]
+            flat = flat_face(Part.makeFace(wires, 'Part::FaceMakerBullseye').Faces[0])
+        except Part.OCCError as exc:
+            raise ExportError('An operation boundary could not be rebuilt from exact lines and arcs.') from exc
     for wire in flat.Wires:
         validate_edges(wire)
     if kind == 'OUTLINE':
@@ -224,40 +230,53 @@ def exterior_round(face, thickness):
     return face.normalAt(u,v).dot(radial) > 0  # Convex edge, not a side bore.
 
 
-
-def taper_angle_samples(face, n=5):
-    u0,u1,v0,v1 = face.ParameterRange
-    out = []
-    for i in range(n):
-        for j in range(n):
-            nz = abs(face.normalAt(u0+(u1-u0)*(i+0.5)/n, v0+(v1-v0)*(j+0.5)/n).z)
-            out.append(math.degrees(math.asin(min(1.0, nz))))
-    return out
-
-
-def bspline_taper(face):
-    angles = taper_angle_samples(face)
-    if max(angles) - min(angles) > 1e-4:
+def bspline_taper_angle(face, samples=5):
+    """Taper angle of a B-spline face that keeps one slope everywhere (a chamfer
+    strip or corner written as a spline), else None. The ruled-taper
+    reconstruction check later proves the face really is a taper."""
+    u0, u1, v0, v1 = face.ParameterRange
+    angles = [math.degrees(math.asin(min(1.0, abs(face.normalAt(u0 + (u1 - u0) * (i + 0.5) / samples,
+                                                                 v0 + (v1 - v0) * (j + 0.5) / samples).z))))
+              for i in range(samples) for j in range(samples)]
+    if max(angles) - min(angles) > TAPER_ANGLE_TOL_DEG:
         return None
     angle = sum(angles) / len(angles)
     return angle if 1 < angle < 89 else None
 
 
-def canonical_edge(edge):
-    curve = edge.Curve
-    if isinstance(curve, (Part.Line, Part.Circle)):
+def taper_angle(face):
+    """Taper angle in degrees, measured like a cone's semi-angle."""
+    if isinstance(face.Surface, Part.Cone):
+        return math.degrees(abs(face.Surface.SemiAngle))
+    if isinstance(face.Surface, Part.BSplineSurface):
+        return bspline_taper_angle(face)
+    return math.degrees(math.asin(abs(face.normalAt(0, 0).z)))
+
+
+def canonical_edge(edge, samples=16):
+    """Exact line or arc for a spline edge that is geometrically one, ending on the
+    original vertices; otherwise the edge unchanged, for validate_edges to reject."""
+    if isinstance(edge.Curve, (Part.Line, Part.Circle)) or edge.isClosed():
         return edge
     p0, p1 = edge.FirstParameter, edge.LastParameter
-    pts = [edge.valueAt(p0 + (p1 - p0) * k / 16) for k in range(17)]
-    a, b = pts[0], pts[-1]
-    if (b - a).Length > TOL and abs((b - a).Length - edge.Length) < 1e-6:
+    points = [edge.valueAt(p0 + (p1 - p0) * k / samples) for k in range(samples + 1)]
+    ends = [vertex.Point for vertex in edge.Vertexes]
+    a = min(ends, key=lambda p: (p - points[0]).Length)
+    b = min(ends, key=lambda p: (p - points[-1]).Length)
+    chord = b - a
+    if chord.Length <= TOL:
+        return edge
+    direction = App.Vector(chord).normalize()
+    if (abs(chord.Length - edge.Length) < EXACT_FIT_TOL
+            and max((p - a).cross(direction).Length for p in points) < EXACT_FIT_TOL):
         return Part.makeLine(a, b)
     try:
-        arc = Part.Arc(a, pts[8], b).toShape()
-    except Exception:
+        arc = Part.Arc(a, points[samples // 2], b).toShape()
+    except Part.OCCError:  # collinear points: not an arc
         return edge
-    c = arc.Curve
-    if max(abs((p - c.Center).Length - c.Radius) for p in pts) < 1e-6 and abs(arc.Length - edge.Length) < 1e-6:
+    circle = arc.Curve
+    if (abs(arc.Length - edge.Length) < EXACT_FIT_TOL
+            and max(abs((p - circle.Center).Length - circle.Radius) for p in points) < EXACT_FIT_TOL):
         return arc
     return edge
 
@@ -270,8 +289,7 @@ def level_wires(faces, level, bounds):
                 if not any(edge.isSame(e) for e in edges): edges.append(edge)
     edges = [canonical_edge(e) for e in edges]
     wires = []
-    for chain in Part.sortEdges(edges):
-        if not chain: raise ExportError('Cannot order the tapered-cut boundary.')
+    for chain in Part.sortEdges(edges, TOL):
         wire = Part.Wire(chain)
         if not wire.isClosed():
             ends=[]
@@ -292,15 +310,23 @@ def level_wires(faces, level, bounds):
 
 
 def extract_tapers(shape, faces):
-    groups={}
+    # Group by exact levels within TOL. The levels themselves are passed on, so
+    # level_wires matches edges at the true depth rather than a rounded one.
+    groups=[]
     for face in faces:
-        angle=math.degrees(abs(face.Surface.SemiAngle)) if isinstance(face.Surface,Part.Cone) else (bspline_taper(face) if isinstance(face.Surface,Part.BSplineSurface) else math.degrees(math.asin(abs(face.normalAt(0,0).z))))
+        angle=taper_angle(face)
         fb=face.optimalBoundingBox()
-        key=(round(fb.ZMin,4)+0.0,round(fb.ZMax,4)+0.0,round(angle,4))
-        groups.setdefault(key,[]).append(face)
+        for group in groups:
+            if abs(group[0]-fb.ZMin)<TOL and abs(group[1]-fb.ZMax)<TOL and abs(group[2]-angle)<TAPER_ANGLE_TOL_DEG:
+                group[3].append(face);break
+        else:
+            groups.append([fb.ZMin,fb.ZMax,angle,[face]])
+    bounds=shape.optimalBoundingBox()
+    thickness=bounds.ZLength
     results=[]
-    for (low,high,angle),fs in groups.items():
-        lower=level_wires(fs,low,shape.optimalBoundingBox());upper=level_wires(fs,high,shape.optimalBoundingBox())
+    for low,high,angle,fs in groups:
+        angle=round(angle,6)+0.0
+        lower=level_wires(fs,low,bounds);upper=level_wires(fs,high,bounds)
         if not lower or len(lower)!=len(upper):raise ExportError('Taper boundary counts do not match.')
         used=set()
         for lo in lower:
@@ -314,7 +340,6 @@ def extract_tapers(shape, faces):
             wide,narrow=(lowface,highface) if lowface.Area>highface.Area else (highface,lowface)
             rear=wide.CenterOfMass.z<narrow.CenterOfMass.z
             side='BACK' if rear else 'FRONT'
-            thickness=shape.optimalBoundingBox().ZLength
             start=wide.CenterOfMass.z if rear else thickness-wide.CenterOfMass.z
             end=narrow.CenterOfMass.z if rear else thickness-narrow.CenterOfMass.z
             if end<=start+TOL:raise ExportError('Taper cutting depths are reversed.')
@@ -326,11 +351,12 @@ def manufacturing_footprint(shape, horizontal, round_faces):
     projected=[flat_face(f) for f in horizontal]
     # Include exact cross sections at the finishing-radius transitions. Broad
     # faces alone are inset by a roundover and would make the blank too small.
-    levels={round(shape.BoundBox.ZLength/2,6)}
+    thickness=shape.optimalBoundingBox().ZLength
+    levels={round(thickness/2,6)}
     for face in round_faces:
         levels.update([round(face.BoundBox.ZMin,6),round(face.BoundBox.ZMax,6)])
     for level in sorted(levels):
-        if TOL<level<shape.BoundBox.ZLength-TOL:
+        if TOL<level<thickness-TOL:
             wires=shape.slice(Z,level)
             if wires:
                 section=Part.makeFace(wires,'Part::FaceMakerBullseye')
@@ -367,7 +393,7 @@ def analyse_solid(solid, label, normal=None):
                 (cones if isinstance(surface, Part.Cone) else cylinders).append(face)
         elif isinstance(surface, Part.Sphere) and exterior_round(face, thickness):
             round_faces.append(face)
-        elif isinstance(surface, Part.BSplineSurface) and bspline_taper(face) is not None:
+        elif isinstance(surface, Part.BSplineSurface) and bspline_taper_angle(face) is not None:
             taper_faces.append(face)
         else:
             raise ExportError('Face %d uses unsupported %s geometry.' % (i + 1, type(surface).__name__))
@@ -878,12 +904,13 @@ def extend_rebate(face, outline, distance, part_shape, depth, side):
         raise ExportError('Rebate extension needs a valid machining face and pocket depth.')
     original = canonical_xy_face(face)
     stock_outline = canonical_xy_face(outline)
-    thickness = part_shape.BoundBox.ZLength
+    bounds = part_shape.optimalBoundingBox()
+    thickness = bounds.ZLength
     if depth > thickness + TOL:
         raise ExportError('Pocket depth exceeds the panel thickness.')
     volume_tolerance = max(1e-4, part_shape.Volume * 1e-9)
     area_tolerance = max(1e-5, original.Area * 1e-9)
-    z_base = part_shape.BoundBox.ZMax - depth if side == 'FRONT' else part_shape.BoundBox.ZMin
+    z_base = bounds.ZMax - depth if side == 'FRONT' else bounds.ZMin
 
     def band(a, b, direction, start, finish):
         points = [a + direction * start, b + direction * start,
