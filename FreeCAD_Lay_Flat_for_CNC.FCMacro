@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""FreeCAD Lay Flat for CNC 0.12.9 -- FreeCAD macro, millimetres. Requires lay_flat_sheet.py.
+"""FreeCAD Lay Flat for CNC 0.12.10 -- FreeCAD macro, millimetres. Requires lay_flat_sheet.py.
 
 Run in FreeCAD. Select finished Bodies/parts (optional); otherwise the dialog
 lists Bodies. Each solid is one part. Source objects are never changed.
@@ -26,13 +26,14 @@ from pathlib import Path
 import FreeCAD as App
 import Part
 
-VERSION = '0.12.9'
+VERSION = '0.12.10'
 PANEL_TAG = 'LayFlatPanel'
 STOCK_THICKNESS_TOL = 0.05
 TOL = 1e-5
 ANG_TOL = 1e-7
 TAPER_ANGLE_TOL_DEG = 1e-4  # taper faces whose angles agree this closely are one cut
 EXACT_FIT_TOL = 1e-6  # spline edges this close to a line or arc are rebuilt as one
+PANEL_EDGE_CONTINUE_MIN = 1e-3  # mm; nearer a panel edge, taper arcs keep the plain loft (continue_past_panel_edge)
 Z = App.Vector(0, 0, 1)
 
 
@@ -284,7 +285,10 @@ def canonical_edge(edge, samples=16):
     return edge
 
 
-def level_wires(faces, level, bounds):
+def level_wires(faces, level, bounds, closing_lines=None):
+    """Closed contours of the taper faces' edges at one level. An open contour is
+    closed along the panel edge it ends on; if closing_lines is a list, each such
+    line is recorded there as (start, end, outward normal of that panel edge)."""
     edges = []
     for face in faces:
         for edge in face.Edges:
@@ -303,13 +307,151 @@ def level_wires(faces, level, bounds):
             ends=[p for p in ends if sum(any((v.Point-p).Length<TOL for v in e.Vertexes) for e in chain)==1]
             if len(ends)!=2:raise ExportError('An open taper does not have two boundary endpoints.')
             a,b=ends
-            on_stock_edge=any(abs(getattr(a,axis)-bound)<TOL and abs(getattr(b,axis)-bound)<TOL
-                              for axis, bound in [('x',bounds.XMin),('x',bounds.XMax),('y',bounds.YMin),('y',bounds.YMax)])
-            if not on_stock_edge:raise ExportError('Open taper ends do not lie on one panel edge.')
+            sides=[outward for axis, bound, outward in [('x',bounds.XMin,App.Vector(-1,0,0)),('x',bounds.XMax,App.Vector(1,0,0)),
+                                                        ('y',bounds.YMin,App.Vector(0,-1,0)),('y',bounds.YMax,App.Vector(0,1,0))]
+                   if abs(getattr(a,axis)-bound)<TOL and abs(getattr(b,axis)-bound)<TOL]
+            if not sides:raise ExportError('Open taper ends do not lie on one panel edge.')
             wire=Part.Wire(chain+[Part.makeLine(a,b)])
+            if closing_lines is not None:closing_lines.append((a,b,sides[0]))
         if not wire.isClosed():raise ExportError('Taper boundary is not closed.')
         wires.append(wire)
     return wires
+
+
+def continue_past_panel_edge(wire, closing_lines):
+    """A taper contour for the reconstruction check's ruled loft, never for drawings.
+
+    A ruled loft is the cut's exact cone only where the matching arcs at the two
+    depths span equal angles. A panel edge that cuts the cone off its axis (for
+    example a paired pull centred on the gap between two panels) ends the arcs at
+    a different angle at each depth, so the loft falls short of the cone. Each arc
+    that ends on the panel edge is therefore continued, outside the panel, to an
+    angle that does not depend on its radius: along the edge when its centre lies
+    beyond the edge, otherwise straight out across it. Pieces of one circle that
+    then meet are joined, and the closing line follows (it disappears where the
+    ends meet). The blank has no material outside the panel, so only the loft's
+    error changes. Within PANEL_EDGE_CONTINUE_MIN of the edge the plain loft's
+    error is negligible and new edges that close to the blank can break the
+    boolean, so such arcs are left alone. Returns the same wire object when
+    nothing needs to change."""
+    edges = wire.OrderedEdges
+    closing = outward = None
+    for start, end, normal in closing_lines:
+        for edge in edges:
+            points = [v.Point for v in edge.Vertexes]
+            if isinstance(edge.Curve, Part.Line) and len(points) == 2 and (
+                    ((points[0] - start).Length < TOL and (points[1] - end).Length < TOL) or
+                    ((points[0] - end).Length < TOL and (points[1] - start).Length < TOL)):
+                closing, outward = edge, normal
+                break
+        if closing is not None:
+            break
+    if closing is None:
+        return wire
+    a, b = closing.Vertexes[0].Point, closing.Vertexes[-1].Point
+    along = b - a
+    along.normalize()
+    moved = []
+    result = []
+    for edge in edges:
+        if edge.isSame(closing):
+            continue
+        if not isinstance(edge.Curve, Part.Circle) or edge.isClosed():
+            result.append(edge)
+            continue
+        centre, radius = edge.Curve.Center, edge.Curve.Radius
+        ends = [edge.Vertexes[0].Point, edge.Vertexes[-1].Point]
+        targets = []
+        for point in ends:
+            target = point
+            if (point - a).Length < TOL or (point - b).Length < TOL:
+                beyond = (centre - point).dot(outward)  # how far the centre lies past the edge
+                side = (point - centre).dot(along)
+                if beyond >= PANEL_EDGE_CONTINUE_MIN and abs(side) > TOL:
+                    target = centre + along * math.copysign(radius, side)
+                elif -beyond >= PANEL_EDGE_CONTINUE_MIN and radius + beyond >= PANEL_EDGE_CONTINUE_MIN:
+                    target = centre + outward * radius
+            if (target - point).Length > TOL:
+                moved.append((point, target))
+            targets.append(target)
+        if all((t - p).Length <= TOL for t, p in zip(targets, ends)):
+            result.append(edge)
+        elif (targets[0] - targets[1]).Length <= TOL:
+            result.append(Part.makeCircle(radius, centre, Z))
+        else:
+            middle = edge.valueAt((edge.FirstParameter + edge.LastParameter) / 2)
+            result.append(Part.Arc(targets[0], middle, targets[1]).toShape())
+    if not moved:
+        return wire
+    result = join_arcs_at(result, [target for _, target in moved])
+
+    def continued(point):
+        return next((target for p, target in moved if (p - point).Length < TOL), point)
+
+    start, end = continued(a), continued(b)
+    if (start - end).Length > TOL:
+        result.append(Part.makeLine(start, end))
+    chains = Part.sortEdges(result, TOL)
+    if len(chains) != 1:
+        return wire
+    continued_wire = Part.Wire(chains[0])
+    return continued_wire if continued_wire.isClosed() else wire
+
+
+def join_arcs_at(edges, points):
+    """Join each pair of arcs of one circle that meet at one of points into one arc,
+    or into the whole circle when their other ends meet too."""
+    edges = list(edges)
+    while True:
+        arcs = [e for e in edges if isinstance(e.Curve, Part.Circle) and not e.isClosed()]
+        pair = None
+        for i, first in enumerate(arcs):
+            for second in arcs[i + 1:]:
+                if ((first.Curve.Center - second.Curve.Center).Length > TOL
+                        or abs(first.Curve.Radius - second.Curve.Radius) > TOL):
+                    continue
+                ends1 = [v.Point for v in first.Vertexes]
+                ends2 = [v.Point for v in second.Vertexes]
+                meet = [p for p in ends1 if any((p - q).Length < TOL for q in ends2)
+                        and any((p - t).Length < TOL for t in points)]
+                if len(meet) == 1:
+                    pair = first, second, meet[0], ends1, ends2
+                    break
+            if pair:
+                break
+        if pair is None:
+            return edges
+        first, second, meet, ends1, ends2 = pair
+        other1 = next(p for p in ends1 if (p - meet).Length >= TOL)
+        other2 = next(p for p in ends2 if (p - meet).Length >= TOL)
+        if (other1 - other2).Length < TOL:
+            joined = Part.makeCircle(first.Curve.Radius, first.Curve.Center, Z)
+        else:
+            joined = Part.Arc(other1, meet, other2).toShape()
+        edges = [e for e in edges if not (e.isSame(first) or e.isSame(second))] + [joined]
+
+
+def taper_cutter(lower, upper, lower_closing=(), upper_closing=()):
+    """Ruled solids between a taper's two contours, for the reconstruction check only:
+    (cutter, plain loft). The cutter is the plain loft unless the contours continued
+    past a panel edge give one valid solid."""
+    loft = Part.makeLoft([lower, upper], True, True)
+    try:
+        low = continue_past_panel_edge(lower, lower_closing)
+        high = continue_past_panel_edge(upper, upper_closing)
+        if low is lower and high is upper:
+            return loft, loft
+        # Start whole-circle contours at angle 0, so the circles at both depths start
+        # at the same angle and the ruled lines between them stay radial.
+        low, high = [Part.Wire([Part.makeCircle(w.Edges[0].Curve.Radius, w.Edges[0].Curve.Center, Z)])
+                     if len(w.Edges) == 1 and isinstance(w.Edges[0].Curve, Part.Circle) and w.Edges[0].isClosed()
+                     else w for w in (low, high)]
+        cut = Part.makeLoft([low, high], True, True)
+        if cut.isValid() and len(cut.Solids) == 1:
+            return cut, loft
+    except Exception:  # Part.OCCError or FreeCAD's own RuntimeError: keep the plain loft
+        pass
+    return loft, loft
 
 
 def extract_tapers(shape, faces):
@@ -329,15 +471,17 @@ def extract_tapers(shape, faces):
     results=[]
     for low,high,angle,fs in groups:
         angle=round(angle,6)+0.0  # report e.g. 44.99999999997 as 45
-        lower=level_wires(fs,low,bounds);upper=level_wires(fs,high,bounds)
+        lower_closing,upper_closing=[],[]
+        lower=level_wires(fs,low,bounds,lower_closing);upper=level_wires(fs,high,bounds,upper_closing)
         if not lower or len(lower)!=len(upper):raise ExportError('Taper boundary counts do not match.')
         used=set()
         for lo in lower:
             options=[(i,hi) for i,hi in enumerate(upper) if i not in used]
             i,hi=min(options,key=lambda pair:(Part.Face(lo).CenterOfMass-Part.Face(pair[1]).CenterOfMass).Length)
             used.add(i)
-            # Ruled solid is bounded by the exact edge contours of the source faces.
-            cut=Part.makeLoft([lo,hi],True,True)
+            # Ruled solid between the exact edge contours of the source faces,
+            # continued past a panel edge where that keeps it on the cone.
+            cut,loft=taper_cutter(lo,hi,lower_closing,upper_closing)
             if not cut.isValid() or len(cut.Solids)!=1:raise ExportError('Taper contours do not form one valid solid.')
             lowface,highface=Part.Face(lo),Part.Face(hi)
             wide,narrow=(lowface,highface) if lowface.Area>highface.Area else (highface,lowface)
@@ -346,7 +490,7 @@ def extract_tapers(shape, faces):
             start=wide.CenterOfMass.z if rear else thickness-wide.CenterOfMass.z
             end=narrow.CenterOfMass.z if rear else thickness-narrow.CenterOfMass.z
             if end<=start+TOL:raise ExportError('Taper cutting depths are reversed.')
-            results.append({'solid':cut,'wide':wide,'narrow':narrow,'angle':angle,'side':side,'start':start,'end':end})
+            results.append({'solid':cut,'loft':loft,'wide':wide,'narrow':narrow,'angle':angle,'side':side,'start':start,'end':end})
     return results
 
 
@@ -367,6 +511,17 @@ def manufacturing_footprint(shape, horizontal, round_faces):
     footprint=projected[0].multiFuse(projected[1:]).removeSplitter() if len(projected)>1 else projected[0]
     if len(footprint.Faces)!=1:raise ExportError('The board silhouette is not one connected planar region.')
     return footprint.Faces[0]
+
+
+def rebuild_part(blank, removals, shape):
+    """The part rebuilt from its operations: (solid, volume it has that the part
+    does not, volume the part has that it does not)."""
+    reconstructed = blank
+    if removals:
+        cutters = removals[0].multiFuse(removals[1:]) if len(removals) > 1 else removals[0]
+        reconstructed = blank.cut(cutters)
+    return reconstructed, reconstructed.cut(shape).Volume, shape.cut(reconstructed).Volume
+
 
 def analyse_solid(solid, label, normal=None):
     shape = orient_pull_front(flatten_solid(solid, normal))
@@ -489,7 +644,10 @@ def analyse_solid(solid, label, normal=None):
         removals.append(removal)
         notes.append('Hole D%s: full diameter to %s mm; drill tip to %s mm, both measured from the original %s surface.' %
                      (mm(2 * radius), mm(depth), mm(tip_depth), side.lower()))
+    plain_lofts = []  # (index in removals, plain loft) to retry with if the rebuild breaks
     for taper in extract_tapers(shape, taper_faces):
+        if taper['loft'] is not taper['solid']:
+            plain_lofts.append((len(removals), taper['loft']))
         removals.append(taper['solid'])
         # The wide mouth must also be clear up to the entry face. For open
         # notches this void joins the stock edge and is not an inner floor wire.
@@ -519,12 +677,13 @@ def analyse_solid(solid, label, normal=None):
         notes.append('Rounded edge finishing regions are reference envelopes, not cutting paths. Exact rounded geometry is retained in STEP and the flat 3D parts.')
     # Strong guard against missed, invented or incorrectly oriented features.
     # Rebuild the final part from exactly these interpreted operations.
-    reconstructed = blank
-    if removals:
-        cutters = removals[0].multiFuse(removals[1:]) if len(removals) > 1 else removals[0]
-        reconstructed = blank.cut(cutters)
-    extra = reconstructed.cut(shape).Volume
-    missing = shape.cut(reconstructed).Volume
+    reconstructed, extra, missing = rebuild_part(blank, removals, shape)
+    if plain_lofts and (not reconstructed.isValid() or min(extra, missing) < -volume_tolerance):
+        # A continued taper cutter broke the boolean: retry with the plain lofts.
+        retry = list(removals)
+        for index, loft in plain_lofts:
+            retry[index] = loft
+        reconstructed, extra, missing = rebuild_part(blank, retry, shape)
     roundover_volume=0.0
     if round_faces and extra>volume_tolerance:
         envelopes=[]
@@ -536,6 +695,10 @@ def analyse_solid(solid, label, normal=None):
         residual=reconstructed.cut(shape)
         extra=residual.cut(envelope).Volume
         roundover_volume=residual.Volume-extra
+    # A broken boolean gives an invalid solid whose volumes can be negative and
+    # would pass the comparison below whatever the operations are.
+    if not reconstructed.isValid() or min(extra, missing) < -volume_tolerance:
+        raise ExportError('The operations could not be checked: rebuilding this part from them failed.')
     if max(extra, missing) > volume_tolerance:
         raise ExportError('Operations do not reproduce this solid outside the labelled rounded-edge finishing regions (unexplained %.6f mm3, overcut %.6f mm3).' % (extra, missing))
     return {'label': label, 'shape': shape, 'width_mm': bb.XLength,
