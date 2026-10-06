@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""FreeCAD Lay Flat for CNC 0.12.10 -- FreeCAD macro, millimetres. Requires lay_flat_sheet.py.
+"""FreeCAD Lay Flat for CNC 0.12.11 -- FreeCAD macro, millimetres. Requires lay_flat_sheet.py.
 
 Run in FreeCAD. Select finished Bodies/parts (optional); otherwise the dialog
 lists Bodies. Each solid is one part. Source objects are never changed.
@@ -14,6 +14,7 @@ identified roundover envelopes. Rebate extensions cannot remove final material.
 Fixed rotations/grain controls and stock sheets are set in the export dialog.
 """
 import csv
+import itertools
 import json
 import math
 import os
@@ -26,7 +27,7 @@ from pathlib import Path
 import FreeCAD as App
 import Part
 
-VERSION = '0.12.10'
+VERSION = '0.12.11'
 PANEL_TAG = 'LayFlatPanel'
 STOCK_THICKNESS_TOL = 0.05
 TOL = 1e-5
@@ -709,6 +710,26 @@ def analyse_solid(solid, label, normal=None):
                              'method': 'Prismatic and ruled-taper reconstruction; remaining removal must lie within convex roundover envelopes.'}}
 
 
+def bulge_extremes(x1, y1, x2, y2, bulge):
+    """Axis-extreme points of a DXF bulge arc that lie inside its sweep."""
+    chord = math.hypot(x2 - x1, y2 - y1)
+    if abs(bulge) < 1e-14 or chord <= TOL:
+        return []
+    sweep = 4 * math.atan(bulge)
+    offset = chord * (1 - bulge * bulge) / (4 * bulge)
+    cx = (x1 + x2) / 2 - offset * (y2 - y1) / chord
+    cy = (y1 + y2) / 2 + offset * (x2 - x1) / chord
+    radius = math.hypot(x1 - cx, y1 - cy)
+    start = math.atan2(y1 - cy, x1 - cx)
+    points = []
+    for quarter in range(4):
+        angle = quarter * math.pi / 2
+        travel = (angle - start) % (2 * math.pi) if sweep > 0 else (start - angle) % (2 * math.pi)
+        if travel <= abs(sweep):
+            points.append((cx + radius * math.cos(angle), cy + radius * math.sin(angle)))
+    return points
+
+
 # Minimal ASCII DXF writer. Geometry stays analytic: closed LWPOLYLINE with
 # circular-arc bulges, plus CIRCLE for round holes. No tessellation or splines.
 class Dxf:
@@ -768,6 +789,8 @@ class Dxf:
     def add_text(self, text, x, y, height=5):
         # DXF text is ASCII; labels are metadata and never cutting geometry.
         text = str(text).encode('ascii', 'replace').decode().replace('\n', ' ')
+        if not text.strip():
+            return
         self.entities.append([(0, 'TEXT'), (100, 'AcDbEntity'), (8, 'LABELS'), (100, 'AcDbText'),
                               (10, x), (20, y), (30, 0), (40, height), (1, text), (7, 'STANDARD')])
 
@@ -783,49 +806,130 @@ class Dxf:
             if layer not in palette:
                 raise ExportError('No colour assigned for layer %s.' % layer)
             self.layers[layer] = palette[layer]['aci']
-        tags = [(0, 'SECTION'), (2, 'HEADER'), (9, '$ACADVER'), (1, 'AC1018'),
-                (9, '$INSUNITS'), (70, 4), (9, '$MEASUREMENT'), (70, 1),
-                (9, '$LUNITS'), (70, 2), (9, '$LUPREC'), (70, 6), (0, 'ENDSEC'),
-                (0, 'SECTION'), (2, 'TABLES'),
-                (0, 'TABLE'), (2, 'LTYPE'), (70, 1),
-                (0, 'LTYPE'), (100, 'AcDbSymbolTableRecord'), (100, 'AcDbLinetypeTableRecord'),
-                (2, 'CONTINUOUS'), (70, 0), (3, 'Solid line'), (72, 65), (73, 0), (40, 0), (0, 'ENDTAB'),
-                (0, 'TABLE'), (2, 'LAYER'), (70, len(self.layers))]
-        for name, colour in sorted(self.layers.items()):
-            tags += [(0, 'LAYER'), (100, 'AcDbSymbolTableRecord'), (100, 'AcDbLayerTableRecord'),
-                     (2, name), (70, 0), (62, colour), (6, 'CONTINUOUS')]
-            if 'true_colour' in palette[name]:
-                tags.append((420, palette[name]['true_colour']))
-        tags += [(0, 'ENDTAB'), (0, 'TABLE'), (2, 'STYLE'), (70, 1),
-                 (0, 'STYLE'), (100, 'AcDbSymbolTableRecord'), (100, 'AcDbTextStyleTableRecord'),
-                 (2, 'STANDARD'), (70, 0), (40, 0), (41, 1), (50, 0), (71, 0), (42, 2.5), (3, 'txt'), (4, ''),
-                 (0, 'ENDTAB'), (0, 'ENDSEC'), (0, 'SECTION'), (2, 'ENTITIES')]
+        # AC1018 readers (VCarve, ODA-based CAM) need the full R2000+ object
+        # graph: entities owned by a *Model_Space block record, BLOCKS for
+        # model/paper space, layouts and a root dictionary. Without them the
+        # reader stops at ENTITIES and imports nothing.
+        handles = itertools.count(0x20)
+        def handle():
+            return '%X' % next(handles)
+        model_record, paper_record = handle(), handle()
+        model_layout, paper_layout = handle(), handle()
+        root_dict, group_dict, layout_dict = handle(), handle(), handle()
+        plot_styles, plot_style_normal = handle(), handle()
+
+        def table(name, records, subclass=None):
+            owner = handle()
+            tags = [(0, 'TABLE'), (2, name), (5, owner), (330, '0'), (100, 'AcDbSymbolTable'), (70, len(records))]
+            if subclass:
+                tags.append((100, subclass))
+            for record_handle, body in records:
+                tags += [(0, name), (105 if name == 'DIMSTYLE' else 5, record_handle or handle()),
+                         (330, owner), (100, 'AcDbSymbolTableRecord')] + body
+            return tags + [(0, 'ENDTAB')]
+
+        xs, ys = [], []
         for entity in self.entities:
-            tags.extend(entity)
-        tags += [(0, 'ENDSEC'), (0, 'EOF')]
-        # Explicit record handles avoid requiring a reader to repair table heads.
-        handled = []
-        next_handle = 0x100
-        table_name_next = False
-        table_handle = None
-        for code, value in tags:
-            handled.append((code, value))
-            if table_name_next:
-                table_handle = '%X' % next_handle
-                next_handle += 1
-                handled += [(5, table_handle), (330, '0'), (100, 'AcDbSymbolTable')]
-                table_name_next = False
-            elif code == 0 and value == 'TABLE':
-                table_name_next = True
-            elif code == 0 and value == 'ENDTAB':
-                table_handle = None
-            elif code == 0 and value in ('LTYPE', 'LAYER', 'STYLE', 'LWPOLYLINE', 'CIRCLE', 'TEXT', 'LINE'):
-                handled.append((5, '%X' % next_handle))
-                next_handle += 1
-                if table_handle is not None:
-                    handled.append((330, table_handle))
+            values = dict(entity)
+            radius = values.get(40, 0) if values[0] == 'CIRCLE' else 0
+            for code, value in entity:
+                if code in (10, 11):
+                    xs += [value - radius, value + radius]
+                elif code in (20, 21):
+                    ys += [value - radius, value + radius]
+            if values[0] == 'LWPOLYLINE':
+                vertices = []
+                for code, value in entity:
+                    if code == 10:
+                        vertices.append([value, 0.0, 0.0])
+                    elif code == 20:
+                        vertices[-1][1] = value
+                    elif code == 42:
+                        vertices[-1][2] = value
+                following = vertices[1:] + (vertices[:1] if values.get(70, 0) & 1 else [])
+                for (x1, y1, bulge), (x2, y2, _) in zip(vertices, following):
+                    for x, y in bulge_extremes(x1, y1, x2, y2, bulge):
+                        xs.append(x)
+                        ys.append(y)
+        xmin, xmax = (min(xs), max(xs)) if xs else (0.0, 1.0)
+        ymin, ymax = (min(ys), max(ys)) if ys else (0.0, 1.0)
+        view_height = max(ymax - ymin, (xmax - xmin) / 1.5, 1.0) * 1.1
+
+        tables = table('VPORT', [(None, [(100, 'AcDbViewportTableRecord'), (2, '*Active'), (70, 0),
+                                         (10, 0.0), (20, 0.0), (11, 1.0), (21, 1.0),
+                                         (12, (xmin + xmax) / 2), (22, (ymin + ymax) / 2),
+                                         (13, 0.0), (23, 0.0), (14, 10.0), (24, 10.0), (15, 10.0), (25, 10.0),
+                                         (16, 0.0), (26, 0.0), (36, 1.0), (17, 0.0), (27, 0.0), (37, 0.0),
+                                         (40, view_height), (41, 1.5), (42, 50.0), (43, 0.0), (44, 0.0),
+                                         (50, 0.0), (51, 0.0), (71, 0), (72, 100), (73, 1), (74, 3),
+                                         (75, 0), (76, 0), (77, 0), (78, 0)])])
+        tables += table('LTYPE', [(None, [(100, 'AcDbLinetypeTableRecord'), (2, name), (70, 0), (3, text), (72, 65), (73, 0), (40, 0.0)])
+                                  for name, text in (('ByBlock', ''), ('ByLayer', ''), ('CONTINUOUS', 'Solid line'))])
+        layers = []
+        for name, colour in sorted(self.layers.items()):
+            body = [(100, 'AcDbLayerTableRecord'), (2, name), (70, 0), (62, colour), (6, 'CONTINUOUS')]
+            if 'true_colour' in palette[name]:
+                body.append((420, palette[name]['true_colour']))
+            layers.append((None, body + [(370, -3), (390, plot_style_normal)]))
+        tables += table('LAYER', layers)
+        tables += table('STYLE', [(None, [(100, 'AcDbTextStyleTableRecord'), (2, 'STANDARD'), (70, 0), (40, 0.0),
+                                          (41, 1.0), (50, 0.0), (71, 0), (42, 2.5), (3, 'txt')])])
+        tables += table('VIEW', []) + table('UCS', [])
+        tables += table('APPID', [(None, [(100, 'AcDbRegAppTableRecord'), (2, 'ACAD'), (70, 0)])])
+        tables += table('DIMSTYLE', [(None, [(100, 'AcDbDimStyleTableRecord'), (2, 'STANDARD'), (70, 0)])],
+                        'AcDbDimStyleTable')
+        tables += table('BLOCK_RECORD', [(model_record, [(100, 'AcDbBlockTableRecord'), (2, '*Model_Space'), (340, model_layout)]),
+                                         (paper_record, [(100, 'AcDbBlockTableRecord'), (2, '*Paper_Space'), (340, paper_layout)])])
+
+        blocks = []
+        for record, name, space in ((model_record, '*Model_Space', []), (paper_record, '*Paper_Space', [(67, 1)])):
+            blocks += [(0, 'BLOCK'), (5, handle()), (330, record), (100, 'AcDbEntity')] + space + [
+                       (8, '0'), (100, 'AcDbBlockBegin'), (2, name), (70, 0), (10, 0.0), (20, 0.0), (30, 0.0), (3, name),
+                       (0, 'ENDBLK'), (5, handle()), (330, record), (100, 'AcDbEntity')] + space + [
+                       (8, '0'), (100, 'AcDbBlockEnd')]
+
+        entities = []
+        for entity in self.entities:
+            entities += [entity[0], (5, handle()), (330, model_record)] + list(entity[1:])
+            if entity[0][1] == 'TEXT':
+                entities.append((100, 'AcDbText'))
+
+        def layout(own, name, record, order, flags):
+            return [(0, 'LAYOUT'), (5, own), (330, layout_dict), (100, 'AcDbPlotSettings'), (1, ''), (4, 'A3'), (6, ''),
+                    (40, 7.5), (41, 20.0), (42, 7.5), (43, 20.0), (44, 420.0), (45, 297.0), (46, 0.0), (47, 0.0),
+                    (48, 0.0), (49, 0.0), (140, 0.0), (141, 0.0), (142, 1.0), (143, 1.0), (70, flags), (72, 1),
+                    (73, 0), (74, 5), (7, ''), (75, 16), (76, 0), (77, 2), (78, 300), (147, 1.0), (148, 0.0),
+                    (149, 0.0), (100, 'AcDbLayout'), (1, name), (70, 1), (71, order), (10, 0.0), (20, 0.0),
+                    (11, 420.0), (21, 297.0), (12, 0.0), (22, 0.0), (32, 0.0), (14, xmin), (24, ymin), (34, 0.0),
+                    (15, xmax), (25, ymax), (35, 0.0), (146, 0.0), (13, 0.0), (23, 0.0), (33, 0.0),
+                    (16, 1.0), (26, 0.0), (36, 0.0), (17, 0.0), (27, 1.0), (37, 0.0), (76, 1), (330, record)]
+        objects = [(0, 'DICTIONARY'), (5, root_dict), (330, '0'), (100, 'AcDbDictionary'), (281, 1),
+                   (3, 'ACAD_GROUP'), (350, group_dict), (3, 'ACAD_LAYOUT'), (350, layout_dict),
+                   (3, 'ACAD_PLOTSTYLENAME'), (350, plot_styles),
+                   (0, 'DICTIONARY'), (5, group_dict), (330, root_dict), (100, 'AcDbDictionary'), (281, 1),
+                   (0, 'DICTIONARY'), (5, layout_dict), (330, root_dict), (100, 'AcDbDictionary'), (281, 1),
+                   (3, 'Layout1'), (350, paper_layout), (3, 'Model'), (350, model_layout),
+                   (0, 'ACDBDICTIONARYWDFLT'), (5, plot_styles), (330, root_dict), (100, 'AcDbDictionary'), (281, 1),
+                   (3, 'Normal'), (350, plot_style_normal), (100, 'AcDbDictionaryWithDefault'), (340, plot_style_normal),
+                   (0, 'ACDBPLACEHOLDER'), (5, plot_style_normal), (330, plot_styles)]
+        objects += layout(model_layout, 'Model', model_record, 0, 1024) + layout(paper_layout, 'Layout1', paper_record, 1, 0)
+
+        tags = [(0, 'SECTION'), (2, 'HEADER'), (9, '$ACADVER'), (1, 'AC1018'), (9, '$DWGCODEPAGE'), (3, 'ANSI_1252'),
+                (9, '$INSBASE'), (10, 0.0), (20, 0.0), (30, 0.0),
+                (9, '$EXTMIN'), (10, xmin), (20, ymin), (30, 0.0), (9, '$EXTMAX'), (10, xmax), (20, ymax), (30, 0.0),
+                (9, '$INSUNITS'), (70, 4), (9, '$MEASUREMENT'), (70, 1),
+                (9, '$LUNITS'), (70, 2), (9, '$LUPREC'), (70, 6), (9, '$HANDSEED'), (5, handle()), (0, 'ENDSEC'),
+                (0, 'SECTION'), (2, 'CLASSES'), (0, 'ENDSEC'),
+                (0, 'SECTION'), (2, 'TABLES')] + tables + [(0, 'ENDSEC'),
+                (0, 'SECTION'), (2, 'BLOCKS')] + blocks + [(0, 'ENDSEC'),
+                (0, 'SECTION'), (2, 'ENTITIES')] + entities + [(0, 'ENDSEC'),
+                (0, 'SECTION'), (2, 'OBJECTS')] + objects + [(0, 'ENDSEC'), (0, 'EOF')]
         with open(path, 'w', encoding='ascii', newline='\n') as stream:
-            for code, value in handled:
+            for code, value in tags:
+                # Optional empty strings are omitted: some line-based readers
+                # treat a blank value line as a premature end of file.
+                if value == '':
+                    continue
                 # 12 decimal places preserve coordinates and arc bulges.
                 value = ('%.12f' % value).rstrip('0').rstrip('.') if isinstance(value, float) else str(value)
                 stream.write('%d\n%s\n' % (code, value))
