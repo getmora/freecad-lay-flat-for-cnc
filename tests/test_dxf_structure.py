@@ -66,10 +66,51 @@ class DxfStructureTests(unittest.TestCase):
     def test_owner_pointers_resolve(self):
         handles={v for c,v in self.pairs if c in (5,105)}|{'0'}
         for code,value in self.pairs:
-            if code in (330,340,350):self.assertIn(value,handles)
+            if code in (330,340,350,390):self.assertIn(value,handles)
+        self.assertTrue(any(c==390 for c,_ in self.pairs))
 
     def test_no_blank_value_lines(self):
         self.assertFalse(any(value=='' for _,value in self.pairs))
+
+    def save(self, drawing):
+        path=Path(self.temp.name)/'extra.dxf'
+        drawing.save(path)
+        return records(path)
+
+    def header_point(self, pairs, name):
+        index=pairs.index((9,name))
+        return float(pairs[index+1][1]), float(pairs[index+2][1])
+
+    def test_text_records_close_subclass_and_empty_labels_are_skipped(self):
+        drawing=ns['Dxf']()
+        drawing.add_wire(ns['rectangle_wire'](10,10),'OUTLINE_THROUGH')
+        drawing.add_text('',1,1)
+        drawing.add_text('   ',1,1)
+        drawing.add_text('Kept',1,1)
+        _,result=self.save(drawing)
+        texts=[r for r in result if r[0]==(0,'TEXT')]
+        self.assertEqual(len(texts),1)
+        self.assertEqual(texts[0][-1],(100,'AcDbText'))
+
+    def test_empty_drawing_is_still_structurally_complete(self):
+        pairs,result=self.save(ns['Dxf']())
+        self.assertIn((2,'OBJECTS'),pairs)
+        self.assertTrue(any(r[0]==(0,'BLOCK_RECORD') for r in result))
+
+    def test_extents_include_arc_bulges(self):
+        # Closed semicircle-ended slot: arcs swell 5 mm past every vertex in y.
+        drawing=ns['Dxf']()
+        drawing.layers['OUTLINE_THROUGH']=7
+        drawing.entities.append([(0,'LWPOLYLINE'),(100,'AcDbEntity'),(8,'OUTLINE_THROUGH'),(100,'AcDbPolyline'),
+                                 (90,2),(70,1),(38,0),(10,0.0),(20,0.0),(42,1.0),(10,10.0),(20,0.0),(42,1.0)])
+        pairs,_=self.save(drawing)
+        self.assertEqual(self.header_point(pairs,'$EXTMIN'),(0.0,-5.0))
+        self.assertEqual(self.header_point(pairs,'$EXTMAX'),(10.0,5.0))
+        self.assertEqual(ns['bulge_extremes'](0,0,10,0,0.0),[])
+        minor=ns['bulge_extremes'](0,0,10,0,-0.2)
+        self.assertEqual(len(minor),1)
+        self.assertAlmostEqual(minor[0][0],5.0)
+        self.assertGreater(minor[0][1],0)
 
 
 if __name__=='__main__':unittest.main()
