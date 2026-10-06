@@ -159,7 +159,7 @@ DXF and SVG sheet drawings share operation layers/groups across parts. The tree 
 
 ### CAM import notes
 
-- **VCarve:** use the standard **DXF** format from version 0.12.11 or later; DXF files from earlier versions do not import. [Vectric documents selection by layer and reusable toolpath templates](https://docs.vectric.com/docs/V12.5/VCarvePro/ENU/Help/page/single-page/#vector-selector). Select the relevant layer and assign the tool, depth and machining operation in CAM. Layer names alone do not create toolpaths.
+- **VCarve:** use the standard **DXF** format from version 0.12.11 or later; standard DXF files from earlier versions do not import. [Vectric documents selection by layer and reusable toolpath templates](https://docs.vectric.com/docs/V12.5/VCarvePro/ENU/Help/page/single-page/#vector-selector). Select the relevant layer and assign the tool, depth and machining operation in CAM. Layer names alone do not create toolpaths.
 - **Mozaik:** its [documented DXF part import](https://mozaik.support.cyncly.com/hc/en-us/articles/44482897665169-Optimizer-Parts-Tab-Customer-Guide) requires **ACAD R12 closed polylines** and does not automatically assign tools to custom operations. The **Mozaik — R12 DXF** option targets that requirement. Use individual-part files, choose millimetres on import and assign machining tools inside Mozaik. The preset's file structure and geometry have been checked; an actual Mozaik import is still **unverified**.
 
 A standard DXF sheet drawing from 0.12.11 has been imported into VCarve Pro successfully. Wider VCarve testing and any Mozaik import have not been verified.
