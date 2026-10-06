@@ -6,14 +6,16 @@ For example, open a cabinet model, choose its sides and shelves, and arrange fla
 
 **Your original model stays in place.** The tool exports separate copies; you do not need to dismantle or flatten your assembly by hand.
 
-**[Download version 0.12.8 — complete ZIP](https://github.com/getmora/freecad-lay-flat-for-cnc/releases/download/v0.12.8/FreeCAD-Lay-Flat-for-CNC-0.12.8.zip)** · [Release notes](https://github.com/getmora/freecad-lay-flat-for-cnc/releases/tag/v0.12.8)
+**[Download version 0.12.11 — complete ZIP](https://github.com/getmora/freecad-lay-flat-for-cnc/releases/download/v0.12.11/FreeCAD-Lay-Flat-for-CNC-0.12.11.zip)** · [Release notes](https://github.com/getmora/freecad-lay-flat-for-cnc/releases/tag/v0.12.11)
 
-## New in 0.12.8
+## New in 0.12.11
 
-- **Create first, export later:** inspect the sheet layout, then right-click to export all sheets or just one.
-- **Clearer operation groups:** matching operations share one item per sheet, with explicit diameter/depth labels and separate non-cutting guides.
-- **More export choices:** standard DXF, 1:1 millimetre SVG, both formats, or a Mozaik-targeted R12 DXF preset. Actual Mozaik import remains unverified.
-- **Less repeated work:** unchanged previews, sheet packing and shared fillet sources reuse validated results. Geometry edits still trigger checks.
+- **Standard DXF now opens in VCarve:** earlier versions wrote DXF files that VCarve Pro refused with *"Syntax error or premature end of file on line/offset 240"* and imported nothing. Standard DXF files now contain the full structure that R2004 readers expect. Geometry, layers and colours are unchanged. **Export again with 0.12.11** to replace older DXF files.
+- **Fewer valid parts rejected:** doors and drawer fronts with chamfered capsule pulls, paired pulls on the meeting edge and open-edge notches now export instead of stopping with taper or *BSplineSurface* errors.
+- **Exact part sizes:** part sizes and placement use exact bounds, so some flipped parts no longer report oversized dimensions and STEP solids line up with the DXF origin.
+- **Stricter checking:** if the machining check cannot rebuild a part reliably, that part is refused instead of passed.
+
+Version 0.12.8 introduced the current workflow: create the sheet layout first, then right-click to export all sheets or one, with DXF, SVG or Mozaik R12 formats.
 
 **Updating from an older version:** use the complete ZIP and installer so the `lay_flat_sheet.py` companion is installed too. It enables the saved layout's right-click export menu.
 
@@ -157,10 +159,10 @@ DXF and SVG sheet drawings share operation layers/groups across parts. The tree 
 
 ### CAM import notes
 
-- **VCarve:** [Vectric documents selection by layer and reusable toolpath templates](https://docs.vectric.com/docs/V12.5/VCarvePro/ENU/Help/page/single-page/#vector-selector). Select the relevant layer and assign the tool, depth and machining operation in CAM. Layer names alone do not create toolpaths.
+- **VCarve:** use the standard **DXF** format from version 0.12.11 or later; DXF files from earlier versions do not import. [Vectric documents selection by layer and reusable toolpath templates](https://docs.vectric.com/docs/V12.5/VCarvePro/ENU/Help/page/single-page/#vector-selector). Select the relevant layer and assign the tool, depth and machining operation in CAM. Layer names alone do not create toolpaths.
 - **Mozaik:** its [documented DXF part import](https://mozaik.support.cyncly.com/hc/en-us/articles/44482897665169-Optimizer-Parts-Tab-Customer-Guide) requires **ACAD R12 closed polylines** and does not automatically assign tools to custom operations. The **Mozaik — R12 DXF** option targets that requirement. Use individual-part files, choose millimetres on import and assign machining tools inside Mozaik. The preset's file structure and geometry have been checked; an actual Mozaik import is still **unverified**.
 
-End-to-end import into either application has not been verified.
+A standard DXF sheet drawing from 0.12.11 has been imported into VCarve Pro successfully. Wider VCarve testing and any Mozaik import have not been verified.
 
 ## What is in the export folder?
 
@@ -217,6 +219,7 @@ In either selection dialog, searching only hides rows: **checked rows remain che
 | There is no right-click export action on an older layout | Run **Lay Flat for CNC** with that layout active to enable sheet-only export. The companion file must be installed. |
 | The export menu is missing after reopening a saved layout | Install the complete package on this computer, including `lay_flat_sheet.py`, then reopen the layout. |
 | Export says the layout geometry changed | Undo the geometry edits or create a fresh layout from the original model. |
+| VCarve reports *"Syntax error or premature end of file on line/offset 240"* or *"No data was imported"* | The DXF was exported with version 0.12.10 or earlier. Update to 0.12.11 and export again. |
 | An unexpected error occurs | Open **View → Panels → Report View** for details. |
 
 <details>
