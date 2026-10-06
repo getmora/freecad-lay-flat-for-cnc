@@ -846,7 +846,8 @@ class Dxf:
                         vertices[-1][1] = value
                     elif code == 42:
                         vertices[-1][2] = value
-                for (x1, y1, bulge), (x2, y2, _) in zip(vertices, vertices[1:] + vertices[:1]):
+                following = vertices[1:] + (vertices[:1] if values.get(70, 0) & 1 else [])
+                for (x1, y1, bulge), (x2, y2, _) in zip(vertices, following):
                     for x, y in bulge_extremes(x1, y1, x2, y2, bulge):
                         xs.append(x)
                         ys.append(y)

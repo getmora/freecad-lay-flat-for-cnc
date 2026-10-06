@@ -96,6 +96,10 @@ class DxfStructureTests(unittest.TestCase):
         pairs,result=self.save(ns['Dxf']())
         self.assertIn((2,'OBJECTS'),pairs)
         self.assertTrue(any(r[0]==(0,'BLOCK_RECORD') for r in result))
+        self.assertEqual(self.header_point(pairs,'$EXTMIN'),(0.0,0.0))
+        self.assertEqual(self.header_point(pairs,'$EXTMAX'),(1.0,1.0))
+        vport=next(r for r in result if r[0]==(0,'VPORT'))
+        self.assertGreater(float(dict(vport)[40]),0)
 
     def test_extents_include_arc_bulges(self):
         # Closed semicircle-ended slot: arcs swell 5 mm past every vertex in y.
@@ -104,8 +108,12 @@ class DxfStructureTests(unittest.TestCase):
         drawing.entities.append([(0,'LWPOLYLINE'),(100,'AcDbEntity'),(8,'OUTLINE_THROUGH'),(100,'AcDbPolyline'),
                                  (90,2),(70,1),(38,0),(10,0.0),(20,0.0),(42,1.0),(10,10.0),(20,0.0),(42,1.0)])
         pairs,_=self.save(drawing)
-        self.assertEqual(self.header_point(pairs,'$EXTMIN'),(0.0,-5.0))
-        self.assertEqual(self.header_point(pairs,'$EXTMAX'),(10.0,5.0))
+        for name,expected in (('$EXTMIN',(0.0,-5.0)),('$EXTMAX',(10.0,5.0))):
+            for actual,wanted in zip(self.header_point(pairs,name),expected):self.assertAlmostEqual(actual,wanted,places=9)
+        # An open polyline's last-vertex bulge does not describe a closing arc.
+        drawing.entities[0]=[(70,0) if code==70 else (code,value) for code,value in drawing.entities[0]]
+        pairs,_=self.save(drawing)
+        self.assertAlmostEqual(self.header_point(pairs,'$EXTMAX')[1],0.0,places=9)
         self.assertEqual(ns['bulge_extremes'](0,0,10,0,0.0),[])
         minor=ns['bulge_extremes'](0,0,10,0,-0.2)
         self.assertEqual(len(minor),1)
